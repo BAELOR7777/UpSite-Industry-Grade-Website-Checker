@@ -1,0 +1,8 @@
+{
+  "name": "upsite",
+  "description": "Website availability monitor and bulk URL checker with response time, HTTP status, SSL certificate, DNS resolution, redirect chain inspection, and CSV/PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,53 @@
+name: Build Windows Executable (.exe)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install project dependencies
+        run: npm install
+
+      - name: Build web frontend
+        run: npm run build
+
+      - name: Bundle Express server for Electron
+        run: npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist-server/server.mjs
+
+      - name: Install Electron packager
+        run: npm install --no-save electron@33 electron-builder@25
+
+      - name: Package Windows .exe installer & portable binary
+        run: |
+          npx electron-builder --win nsis portable `
+            --config.appId=com.upsite.desktop `
+            --config.productName=upsite `
+            --config.directories.output=release `
+            --config.files="dist/**/*" `
+            --config.files="dist-server/**/*" `
+            --config.files="electron/**/*" `
+            --config.files="package.json" `
+            --config.extraMetadata.main="electron/main.cjs" `
+            --config.win.target=nsis,portable
+
+      - name: Upload Windows .exe Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: upsite-windows-exe
+          path: |
+            release/*.exe
+          if-no-files-found: error
