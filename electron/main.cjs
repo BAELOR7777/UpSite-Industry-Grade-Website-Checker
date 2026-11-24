@@ -1,10 +1,89 @@
 const path = require('node:path');
 const fs = require('node:fs');
+const { execFile } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 
 let mainWindow = null;
 let httpServer = null;
+
+function sanitizePdfFilename(raw) {
+  const base = path.basename(String(raw || 'upsite-report.pdf')).replace(/[^a-zA-Z0-9._-]/g, '-');
+  const trimmed = base.replace(/^-+/, '') || 'upsite-report';
+  return trimmed.toLowerCase().endsWith('.pdf') ? trimmed : `${trimmed}.pdf`;
+}
+
+function writePdfTempOrDownload(dirPath, filename, base64) {
+  if (typeof base64 !== 'string' || base64.length === 0 || base64.length > 20 * 1024 * 1024) {
+    throw new Error('Invalid PDF payload.');
+  }
+  const safeName = sanitizePdfFilename(filename);
+  const cleanBase64 = base64.includes(',') ? base64.split(',').pop() : base64;
+  const buf = Buffer.from(cleanBase64, 'base64');
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  const fullPath = path.join(dirPath, safeName);
+  fs.writeFileSync(fullPath, buf);
+  return fullPath;
+}
+
+function copyFilePathToOsClipboard(filePath) {
+  return new Promise((resolve, reject) => {
+    if (process.platform === 'win32') {
+      execFile(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-STA',
+          '-Command',
+          'Add-Type -AssemblyName System.Windows.Forms; $sc = New-Object System.Collections.Specialized.StringCollection; $sc.Add($env:UPSITE_PDF_PATH); [System.Windows.Forms.Clipboard]::SetFileDropList($sc)',
+        ],
+        { env: { ...process.env, UPSITE_PDF_PATH: filePath }, windowsHide: true },
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        },
+      );
+      return;
+    }
+    if (process.platform === 'darwin') {
+      execFile(
+        'osascript',
+        ['-e', 'on run argv', '-e', 'set the clipboard to POSIX file (item 1 of argv)', '-e', 'end run', '--', filePath],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        },
+      );
+      return;
+    }
+    reject(new Error('File clipboard drop is not supported on this OS.'));
+  });
+}
+
+ipcMain.handle('upsite:copy-pdf-file', async (_event, payload) => {
+  try {
+    const tempDir = path.join(app.getPath('temp'), 'upsite-reports');
+    const filePath = writePdfTempOrDownload(tempDir, payload?.filename, payload?.base64);
+    await copyFilePathToOsClipboard(filePath);
+    return { ok: true, filePath };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Unable to copy PDF file.' };
+  }
+});
+
+ipcMain.handle('upsite:share-pdf-file', async (_event, payload) => {
+  try {
+    const targetDir = app.getPath('downloads') || path.join(app.getPath('temp'), 'upsite-reports');
+    const filePath = writePdfTempOrDownload(targetDir, payload?.filename, payload?.base64);
+    shell.showItemInFolder(filePath);
+    return { ok: true, filePath };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Unable to save PDF file.' };
+  }
+});
 
 async function listenOnPort(expressApp, port) {
   return new Promise((resolve, reject) => {
@@ -54,6 +133,7 @@ async function createWindow() {
     backgroundColor: '#0F111A',
     autoHideMenuBar: true,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,

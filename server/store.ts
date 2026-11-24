@@ -3,11 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AuthUser,
+  CheckTimeWindow,
+  DayOfWeek,
   Organisation,
   SiteCheckResult,
   UserSettings,
 } from '../src/types/upsite.ts';
 import { hashAccessToken, isValidAccessToken } from './issuedTokens.ts';
+import { normalizeOrganisationsProjectOrder } from '../src/utils/organisations.ts';
 
 const DATA_DIR = process.env.UPSITE_DATA_DIR
   ? path.resolve(process.env.UPSITE_DATA_DIR)
@@ -15,7 +18,30 @@ const DATA_DIR = process.env.UPSITE_DATA_DIR
 const DB_PATH = path.join(DATA_DIR, 'upsite-db.json');
 
 export const SESSION_SHORT_TTL_MS = 12 * 60 * 60 * 1000;
-export const SESSION_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const SESSION_REMEMBER_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+
+const VALID_DAYS = new Set<DayOfWeek>(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
+
+export const DEFAULT_CHECK_WINDOW: CheckTimeWindow = {
+  startDay: 'mon',
+  endDay: 'sun',
+  startTime: '00:00',
+  endTime: '23:59',
+};
+
+export function sanitizeCheckWindow(input: unknown): CheckTimeWindow {
+  if (!input || typeof input !== 'object') {
+    return { ...DEFAULT_CHECK_WINDOW };
+  }
+  const obj = input as Partial<CheckTimeWindow>;
+  const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  return {
+    startDay: obj.startDay && VALID_DAYS.has(obj.startDay) ? obj.startDay : 'mon',
+    endDay: obj.endDay && VALID_DAYS.has(obj.endDay) ? obj.endDay : 'sun',
+    startTime: typeof obj.startTime === 'string' && timePattern.test(obj.startTime) ? obj.startTime : '00:00',
+    endTime: typeof obj.endTime === 'string' && timePattern.test(obj.endTime) ? obj.endTime : '23:59',
+  };
+}
 
 export const DEFAULT_SETTINGS: UserSettings = {
   theme: 'dark',
@@ -24,8 +50,10 @@ export const DEFAULT_SETTINGS: UserSettings = {
   slowThresholdMs: 1000,
   autoInspectFirstIssue: false,
   autoRefreshSec: 0,
+  checkWindow: { ...DEFAULT_CHECK_WINDOW },
   density: 'comfortable',
   deepInspect: true,
+  desktopNotifications: true,
 };
 
 interface StoredUser {
@@ -42,6 +70,7 @@ interface UserWorkspace {
   history: SiteCheckResult[];
   organisations: Organisation[];
   settings: UserSettings;
+  checkerInput?: string;
 }
 
 interface UpsiteDatabase {
@@ -188,6 +217,7 @@ function toAuthUser(user: StoredUser): AuthUser {
     username: user.username,
     authType: user.authType,
     tokenMask: user.tokenMask,
+    createdAt: user.createdAt,
   };
 }
 
@@ -197,12 +227,16 @@ function ensureWorkspace(db: UpsiteDatabase, userId: string): UserWorkspace {
       history: [],
       organisations: [],
       settings: { ...DEFAULT_SETTINGS },
+      checkerInput: '',
     };
   }
   return {
     history: db.workspaces[userId].history || [],
-    organisations: db.workspaces[userId].organisations || [],
+    organisations: normalizeOrganisationsProjectOrder(db.workspaces[userId].organisations || []),
     settings: { ...DEFAULT_SETTINGS, ...(db.workspaces[userId].settings || {}) },
+    checkerInput: typeof db.workspaces[userId].checkerInput === 'string'
+      ? db.workspaces[userId].checkerInput
+      : '',
   };
 }
 
@@ -217,7 +251,8 @@ export function registerWithToken(params: {
   const username = params.username.trim();
   const password = params.password;
   const rawToken = params.accessToken.trim();
-  const rememberMe = params.rememberMe !== false;
+  // Always keep newly created accounts signed in until intentional sign-out
+  const rememberMe = true;
 
   if (username.length < 3 || username.length > 32) {
     return { ok: false, error: 'Username must be between 3 and 32 characters.', status: 400 };
@@ -265,6 +300,7 @@ export function registerWithToken(params: {
     history: [],
     organisations: [],
     settings: { ...DEFAULT_SETTINGS },
+    checkerInput: '',
   };
   saveDb(db);
 
@@ -388,9 +424,19 @@ export function clearUserHistory(userId: string): void {
 export function saveUserOrganisations(userId: string, organisations: Organisation[]): Organisation[] {
   const db = loadDb();
   const ws = ensureWorkspace(db, userId);
-  db.workspaces[userId] = { ...ws, organisations };
+  const normalized = normalizeOrganisationsProjectOrder(organisations);
+  db.workspaces[userId] = { ...ws, organisations: normalized };
   saveDb(db);
-  return organisations;
+  return normalized;
+}
+
+export function saveUserCheckerInput(userId: string, checkerInput: string): string {
+  const db = loadDb();
+  const ws = ensureWorkspace(db, userId);
+  const cleaned = checkerInput.slice(0, 20000);
+  db.workspaces[userId] = { ...ws, checkerInput: cleaned };
+  saveDb(db);
+  return cleaned;
 }
 
 export function updateUserSettings(
@@ -421,20 +467,30 @@ export function updateUserSettings(
   if (typeof partial.autoInspectFirstIssue === 'boolean') {
     next.autoInspectFirstIssue = partial.autoInspectFirstIssue;
   }
-  if (
-    partial.autoRefreshSec === 0 ||
-    partial.autoRefreshSec === 300 ||
-    partial.autoRefreshSec === 600 ||
-    partial.autoRefreshSec === 3600 ||
-    partial.autoRefreshSec === 14400
+  if (partial.autoRefreshSec === 0) {
+    next.autoRefreshSec = 0;
+  } else if (
+    typeof partial.autoRefreshSec === 'number' &&
+    Number.isFinite(partial.autoRefreshSec)
   ) {
-    next.autoRefreshSec = partial.autoRefreshSec;
+    const rounded = Math.round(partial.autoRefreshSec);
+    if (rounded >= 60 && rounded <= 86400) {
+      next.autoRefreshSec = rounded;
+    }
+  }
+  if (partial.checkWindow) {
+    next.checkWindow = sanitizeCheckWindow(partial.checkWindow);
+  } else {
+    next.checkWindow = sanitizeCheckWindow(next.checkWindow);
   }
   if (partial.density === 'comfortable' || partial.density === 'compact') {
     next.density = partial.density;
   }
   if (typeof partial.deepInspect === 'boolean') {
     next.deepInspect = partial.deepInspect;
+  }
+  if (typeof partial.desktopNotifications === 'boolean') {
+    next.desktopNotifications = partial.desktopNotifications;
   }
 
   db.workspaces[userId] = { ...ws, settings: next };

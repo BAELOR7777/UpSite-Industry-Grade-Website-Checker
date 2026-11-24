@@ -2,28 +2,39 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronRight,
+  Copy,
   Download,
   FileText,
   Globe,
   Loader2,
   Play,
+  Share2,
   Trash2,
   XCircle,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { SiteCheckResult, SiteStatus, UserSettings } from '../types/upsite';
-import { exportResultsToCsv, exportResultsToPdf } from '../utils/exporters';
+import {
+  copyResultsReport,
+  exportResultsToCsv,
+  exportResultsToPdf,
+  shareResultsPdf,
+} from '../utils/exporters';
+import { isWithinCheckWindow } from '../utils/intervals';
+import { ConfirmModal } from './ConfirmModal';
 
 interface CheckerViewProps {
   urlInput: string;
   onChangeUrlInput: (val: string) => void;
   results: SiteCheckResult[];
   selectedId: string | null;
+  statusFilter: 'all' | 'issues' | SiteStatus;
   isChecking: boolean;
   errorMessage: string | null;
   settings: UserSettings;
   autoRefreshRemaining: number | null;
+  onChangeStatusFilter: (filter: 'all' | 'issues' | SiteStatus) => void;
   onRunCheck: (urls: string[]) => void;
   onSelectResult: (result: SiteCheckResult) => void;
   onClearResults: () => void;
@@ -50,33 +61,49 @@ export function CheckerView({
   onChangeUrlInput,
   results,
   selectedId,
+  statusFilter,
   isChecking,
   errorMessage,
   settings,
   autoRefreshRemaining,
+  onChangeStatusFilter,
   onRunCheck,
   onSelectResult,
   onClearResults,
 }: CheckerViewProps) {
-  const [statusFilter, setStatusFilter] = useState<'all' | SiteStatus>('all');
-
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [shareNotice, setShareNotice] = useState<string | null>(null);
   const parsedUrls = useMemo(() => parseUrlsFromInput(urlInput), [urlInput]);
+
+  const showShareNotice = (msg: string) => {
+    setShareNotice(msg);
+    window.setTimeout(() => {
+      setShareNotice((prev) => (prev === msg ? null : prev));
+    }, 3000);
+  };
 
   const counts = useMemo(() => {
     const online = results.filter((r) => r.status === 'online').length;
     const offline = results.filter((r) => r.status === 'offline').length;
     const error = results.filter((r) => r.status === 'error').length;
-    return { all: results.length, online, offline, error };
+    return {
+      all: results.length,
+      issues: offline + error,
+      online,
+      offline,
+      error,
+    };
   }, [results]);
 
   const filteredResults = useMemo(() => {
     if (statusFilter === 'all') return results;
+    if (statusFilter === 'issues') return results.filter((r) => r.status !== 'online');
     return results.filter((r) => r.status === statusFilter);
   }, [results, statusFilter]);
 
   const handleSubmit = () => {
     if (parsedUrls.length === 0 || isChecking) return;
-    setStatusFilter('all');
+    onChangeStatusFilter('all');
     onRunCheck(parsedUrls);
   };
 
@@ -104,15 +131,17 @@ export function CheckerView({
           <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums whitespace-nowrap">
             {parsedUrls.length} {parsedUrls.length === 1 ? 'URL' : 'URLs'} ready · Max 60
             {autoRefreshRemaining !== null
-              ? ` · Next run in ${
-                  autoRefreshRemaining >= 3600
-                    ? `${String(Math.floor(autoRefreshRemaining / 3600)).padStart(2, '0')}:${String(
-                        Math.floor((autoRefreshRemaining % 3600) / 60),
-                      ).padStart(2, '0')}:${String(autoRefreshRemaining % 60).padStart(2, '0')}`
-                    : `${String(Math.floor(autoRefreshRemaining / 60)).padStart(2, '0')}:${String(
-                        autoRefreshRemaining % 60,
-                      ).padStart(2, '0')}`
-                }`
+              ? !isWithinCheckWindow(settings.checkWindow)
+                ? ' · Paused outside time period'
+                : ` · Next run in ${
+                    autoRefreshRemaining >= 3600
+                      ? `${String(Math.floor(autoRefreshRemaining / 3600)).padStart(2, '0')}:${String(
+                          Math.floor((autoRefreshRemaining % 3600) / 60),
+                        ).padStart(2, '0')}:${String(autoRefreshRemaining % 60).padStart(2, '0')}`
+                      : `${String(Math.floor(autoRefreshRemaining / 60)).padStart(2, '0')}:${String(
+                          autoRefreshRemaining % 60,
+                        ).padStart(2, '0')}`
+                  }`
               : ''}
           </span>
         </div>
@@ -139,10 +168,7 @@ export function CheckerView({
             {(urlInput.trim().length > 0 || results.length > 0) && (
               <button
                 type="button"
-                onClick={() => {
-                  onChangeUrlInput('');
-                  onClearResults();
-                }}
+                onClick={() => setConfirmClearOpen(true)}
                 className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 bg-transparent hover:bg-slate-100 dark:hover:bg-white/[0.05] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
               >
                 <Trash2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
@@ -206,11 +232,12 @@ export function CheckerView({
             <div
               role="tablist"
               aria-label="Filter results by status"
-              className="inline-flex items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#171A28] border border-slate-200 dark:border-white/[0.07]"
+              className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#171A28] border border-slate-200 dark:border-white/[0.07]"
             >
               {(
                 [
                   { id: 'all', label: 'All', count: counts.all },
+                  { id: 'issues', label: 'Issues', count: counts.issues },
                   { id: 'online', label: 'Online', count: counts.online },
                   { id: 'offline', label: 'Offline', count: counts.offline },
                   { id: 'error', label: 'Error', count: counts.error },
@@ -221,7 +248,7 @@ export function CheckerView({
                   type="button"
                   role="tab"
                   aria-selected={statusFilter === tab.id}
-                  onClick={() => setStatusFilter(tab.id)}
+                  onClick={() => onChangeStatusFilter(tab.id)}
                   className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 ${
                     statusFilter === tab.id
                       ? 'bg-slate-900 text-white dark:bg-white/[0.1] dark:text-white'
@@ -233,7 +260,12 @@ export function CheckerView({
               ))}
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {shareNotice && (
+                <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+                  {shareNotice}
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => exportResultsToCsv(filteredResults, 'upsite-results')}
@@ -249,6 +281,30 @@ export function CheckerView({
               >
                 <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
                 <span>Export PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void shareResultsPdf(filteredResults, 'upsite-results')
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Unable to share PDF.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+              >
+                <Share2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Share PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void copyResultsReport(filteredResults, 'upsite-results')
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Clipboard copy unavailable.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+              >
+                <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Copy Report</span>
               </button>
             </div>
           </div>
@@ -379,6 +435,19 @@ export function CheckerView({
           </div>
         </section>
       )}
+      <ConfirmModal
+        open={confirmClearOpen}
+        title="Clear Checker URLs & Results?"
+        description="This will clear all entered target URLs and the current check results from the Checker view."
+        confirmLabel="Clear All"
+        tone="danger"
+        onConfirm={() => {
+          onChangeUrlInput('');
+          onClearResults();
+          setConfirmClearOpen(false);
+        }}
+        onCancel={() => setConfirmClearOpen(false)}
+      />
     </div>
   );
 }

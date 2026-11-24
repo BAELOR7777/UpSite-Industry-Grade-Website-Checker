@@ -53,7 +53,16 @@ export type ActiveView = 'checker' | 'organisation' | 'history' | 'settings';
 
 export type ThemeMode = 'dark' | 'light';
 
-export type AutoRefreshInterval = 0 | 300 | 600 | 3600 | 14400;
+export type AutoRefreshInterval = number;
+
+export type DayOfWeek = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
+
+export interface CheckTimeWindow {
+  startDay: DayOfWeek;
+  endDay: DayOfWeek;
+  startTime: string;
+  endTime: string;
+}
 
 export interface UserSettings {
   theme: ThemeMode;
@@ -62,8 +71,10 @@ export interface UserSettings {
   slowThresholdMs: 0 | 500 | 1000 | 2000;
   autoInspectFirstIssue: boolean;
   autoRefreshSec: AutoRefreshInterval;
+  checkWindow: CheckTimeWindow;
   density: 'comfortable' | 'compact';
   deepInspect: boolean;
+  desktopNotifications: boolean;
 }
 
 export interface ProjectRecord {
@@ -80,6 +91,7 @@ export interface Organisation {
   name: string;
   projects: ProjectRecord[];
   autoRefreshSec?: AutoRefreshInterval;
+  checkWindow?: CheckTimeWindow;
   createdAt: string;
 }
 
@@ -88,10 +100,44 @@ export interface AuthUser {
   username: string;
   authType: 'account' | 'token';
   tokenMask: string;
+  createdAt?: string;
 }
 
 export interface CheckOptions {
   timeoutMs?: number;
   defaultProtocol?: 'https' | 'http';
   deepInspect?: boolean;
+}
+
+export interface AppNotification {
+  id: string;
+  kind: 'org-changes' | 'results-ready';
+  title: string;
+  message: string;
+  createdAt: string;
+  read: boolean;
+  targetView: 'checker' | 'organisation';
+  orgId?: string;
+  downCount: number;
+  backOnlineCount?: number;
+  newErrorCount?: number;
+  firstIssueResult?: SiteCheckResult;
+}
+
+export interface UpsiteDesktopBridge {
+  isDesktop: boolean;
+  copyPdfFile: (
+    filename: string,
+    base64: string,
+  ) => Promise<{ ok: boolean; filePath?: string; error?: string }>;
+  sharePdfFile: (
+    filename: string,
+    base64: string,
+  ) => Promise<{ ok: boolean; filePath?: string; error?: string }>;
+}
+
+declare global {
+  interface Window {
+    upsiteDesktop?: UpsiteDesktopBridge;
+  }
 }

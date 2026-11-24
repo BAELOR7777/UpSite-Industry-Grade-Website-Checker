@@ -1,17 +1,19 @@
-import { Activity, ArrowRight, KeyRound, Loader2, Lock, UserPlus } from 'lucide-react';
+import { Activity, ArrowRight, Eye, EyeOff, KeyRound, Loader2, Lock, UserPlus } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import type { AuthUser, Organisation, SiteCheckResult, UserSettings } from '../types/upsite';
 
 type LoginTab = 'token' | 'register' | 'login';
 
-interface AuthSuccessPayload {
+export interface AuthSuccessPayload {
   sessionToken: string;
+  rememberMe: boolean;
   user: AuthUser;
   workspace?: {
     history: SiteCheckResult[];
     organisations: Organisation[];
     settings: UserSettings;
+    checkerInput?: string;
   };
 }
 
@@ -37,6 +39,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
   const [accessToken, setAccessToken] = useState('');
   const [username, setUsername] = useState(initialSavedUsername);
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -48,12 +51,13 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
     setIsSubmitting(true);
 
     try {
+      const effectiveRemember = activeTab === 'register' ? true : rememberMe;
       let endpoint = '/api/auth/token-login';
-      let body: Record<string, string | boolean> = { accessToken, rememberMe };
+      let body: Record<string, string | boolean> = { accessToken, rememberMe: effectiveRemember };
 
       if (activeTab === 'register') {
         endpoint = '/api/auth/register';
-        body = { username, password, accessToken, rememberMe };
+        body = { username, password, accessToken, rememberMe: true };
       } else if (activeTab === 'login') {
         endpoint = '/api/auth/login';
         body = { username, password, rememberMe };
@@ -75,9 +79,9 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
       }
 
       try {
-        if (rememberMe && (activeTab === 'register' || activeTab === 'login') && username.trim()) {
+        if (effectiveRemember && (activeTab === 'register' || activeTab === 'login') && username.trim()) {
           window.localStorage.setItem(LAST_USERNAME_KEY, username.trim());
-        } else if (!rememberMe) {
+        } else if (!effectiveRemember) {
           window.localStorage.removeItem(LAST_USERNAME_KEY);
         }
       } catch {
@@ -86,6 +90,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
 
       onAuthenticated({
         sessionToken: data.sessionToken,
+        rememberMe: effectiveRemember,
         user: data.user,
         workspace: data.workspace,
       });
@@ -253,18 +258,33 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 >
                   Password
                 </label>
-                <input
-                  id="password-input"
-                  name="password"
-                  type="password"
-                  required
-                  minLength={6}
-                  autoComplete={activeTab === 'register' ? 'new-password' : 'current-password'}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder={activeTab === 'register' ? 'Minimum 6 characters' : 'Enter password'}
-                  className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
-                />
+                <div className="relative">
+                  <input
+                    id="password-input"
+                    name="password"
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    autoComplete={activeTab === 'register' ? 'new-password' : 'current-password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder={activeTab === 'register' ? 'Minimum 6 characters' : 'Enter password'}
+                    className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] pl-3.5 pr-10 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    title={showPassword ? 'Hide password' : 'Show password'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
+                  >
+                    {showPassword ? (
+                      <EyeOff className="w-4 h-4" strokeWidth={1.75} />
+                    ) : (
+                      <Eye className="w-4 h-4" strokeWidth={1.75} />
+                    )}
+                  </button>
+                </div>
               </div>
             </>
           )}
@@ -278,14 +298,17 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 id="remember-me-checkbox"
                 name="rememberMe"
                 type="checkbox"
-                checked={rememberMe}
+                checked={activeTab === 'register' ? true : rememberMe}
+                disabled={activeTab === 'register'}
                 onChange={(e) => setRememberMe(e.target.checked)}
-                className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] bg-slate-50 dark:bg-[#10121C] text-rose-600 focus:ring-rose-500 accent-rose-600 cursor-pointer"
+                className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] bg-slate-50 dark:bg-[#10121C] text-rose-600 focus:ring-rose-500 accent-rose-600 cursor-pointer disabled:opacity-80"
               />
               <span className="font-medium">Remember me</span>
             </span>
             <span className="text-[11px] text-slate-500 dark:text-slate-400">
-              Keep signed in
+              {activeTab === 'register'
+                ? 'Auto signed in until Sign Out'
+                : 'Keep signed in'}
             </span>
           </label>
 

@@ -6,45 +6,84 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  Copy,
   Download,
+  FileOutput,
   FileText,
+  FolderInput,
   FolderPlus,
   Loader2,
   Pencil,
   Play,
   Plus,
+  Share2,
   Trash2,
+  X,
   XCircle,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import type {
   AutoRefreshInterval,
+  CheckTimeWindow,
   Organisation,
   ProjectRecord,
   SiteCheckResult,
   SiteStatus,
   UserSettings,
 } from '../types/upsite';
+import { CheckWindowPicker } from './CheckWindowPicker';
 import { parseUrlsFromInput } from './CheckerView';
-import { exportResultsToCsv, exportResultsToPdf } from '../utils/exporters';
+import { ConfirmModal } from './ConfirmModal';
+import {
+  copyResultsReport,
+  copySimpleOrgReport,
+  exportResultsToCsv,
+  exportResultsToPdf,
+  exportSimpleOrgReportCsv,
+  exportSimpleOrgReportPdf,
+  shareResultsPdf,
+  shareSimpleOrgReportPdf,
+} from '../utils/exporters';
+import type { SimpleOrgSiteRow } from '../utils/exporters';
+import {
+  AUTO_REFRESH_PRESETS,
+  DEFAULT_CHECK_WINDOW,
+  formatCheckWindowLabel,
+  formatIntervalLabel,
+  isWithinCheckWindow,
+  parseCustomIntervalSeconds,
+} from '../utils/intervals';
+import { sortProjectsByName } from '../utils/organisations';
+import { mergeImportedProjects } from '../utils/projectTransfer';
+import type { ImportedProjectDraft } from '../utils/projectTransfer';
+import { BulkImportModal, ExportProjectsModal } from './ProjectTransferModals';
+
+export interface PendingOrgReport {
+  orgName: string;
+  scopeLabel: string;
+  rows: SimpleOrgSiteRow[];
+  onlineCount: number;
+  downCount: number;
+}
 
 interface OrganisationViewProps {
   organisations: Organisation[];
   settings: UserSettings;
   selectedResultId: string | null;
+  openedOrgId: string | null;
+  statusFilter: 'all' | 'issues' | SiteStatus;
+  orgNextRunAt: Record<string, number>;
+  runningOrgScope: Record<string, string>;
+  pendingReport: PendingOrgReport | null;
+  onChangeOpenedOrgId: (orgId: string | null) => void;
+  onChangeStatusFilter: (filter: 'all' | 'issues' | SiteStatus) => void;
   onSaveOrganisations: (orgs: Organisation[]) => void;
-  onRunBatchUrls: (urls: string[]) => Promise<SiteCheckResult[]>;
+  onRunOrgAll: (orgId: string) => Promise<void>;
+  onRunOrgProject: (orgId: string, projectId: string) => Promise<void>;
   onSelectResult: (result: SiteCheckResult) => void;
+  onDismissPendingReport: () => void;
 }
-
-const AUTO_REFRESH_OPTIONS: Array<{ value: AutoRefreshInterval; label: string }> = [
-  { value: 0, label: 'Off' },
-  { value: 300, label: '5 min' },
-  { value: 600, label: '10 min' },
-  { value: 3600, label: '1 hr' },
-  { value: 14400, label: '4 hr' },
-];
 
 export function formatCountdown(totalSeconds: number): string {
   const safe = Math.max(0, Math.floor(totalSeconds));
@@ -58,52 +97,112 @@ export function formatCountdown(totalSeconds: number): string {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
+function formatLastCheckedAt(iso?: string): string | null {
+  if (!iso) return null;
+  const dateObj = new Date(iso);
+  if (Number.isNaN(dateObj.getTime())) return null;
+  const now = new Date();
+  const isSameDay =
+    dateObj.getFullYear() === now.getFullYear() &&
+    dateObj.getMonth() === now.getMonth() &&
+    dateObj.getDate() === now.getDate();
+  const timePart = dateObj.toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  if (isSameDay) {
+    return `Today, ${timePart}`;
+  }
+  const datePart = dateObj.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+  });
+  return `${datePart}, ${timePart}`;
+}
+
 export function OrganisationView({
   organisations,
   settings,
   selectedResultId,
+  openedOrgId,
+  statusFilter,
+  orgNextRunAt,
+  runningOrgScope,
+  pendingReport,
+  onChangeOpenedOrgId,
+  onChangeStatusFilter,
   onSaveOrganisations,
-  onRunBatchUrls,
+  onRunOrgAll,
+  onRunOrgProject,
   onSelectResult,
+  onDismissPendingReport,
 }: OrganisationViewProps) {
-  const [openedOrgId, setOpenedOrgId] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<Record<string, boolean>>({});
   const [newOrgName, setNewOrgName] = useState('');
   const [projectName, setProjectName] = useState('');
   const [projectUrlsInput, setProjectUrlsInput] = useState('');
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
-  const [runningScope, setRunningScope] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<'all' | SiteStatus>('all');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [countdownSec, setCountdownSec] = useState<number | null>(null);
-  const [nextCycleAt, setNextCycleAt] = useState<string | null>(null);
+  const [customPeriodVal, setCustomPeriodVal] = useState('');
+  const [customPeriodUnit, setCustomPeriodUnit] = useState<'min' | 'hr'>('min');
+  const [customPeriodError, setCustomPeriodError] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [shareNotice, setShareNotice] = useState<string | null>(null);
+  const [modalShareNotice, setModalShareNotice] = useState<string | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
+  const [exportProjectsOpen, setExportProjectsOpen] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { kind: 'delete-project'; project: ProjectRecord }
+    | { kind: 'delete-org'; org: Organisation }
+    | null
+  >(null);
+
+  const showShareNotice = (msg: string) => {
+    setShareNotice(msg);
+    window.setTimeout(() => {
+      setShareNotice((prev) => (prev === msg ? null : prev));
+    }, 3000);
+  };
+
+  const showModalShareNotice = (msg: string) => {
+    setModalShareNotice(msg);
+    window.setTimeout(() => {
+      setModalShareNotice((prev) => (prev === msg ? null : prev));
+    }, 3000);
+  };
 
   const activeOrg = useMemo(() => {
     if (!openedOrgId) return null;
     return organisations.find((o) => o.id === openedOrgId) || null;
   }, [organisations, openedOrgId]);
 
+  const sortedProjects = useMemo(
+    () => (activeOrg ? sortProjectsByName(activeOrg.projects) : []),
+    [activeOrg],
+  );
+
+  const runningScope = activeOrg ? runningOrgScope[activeOrg.id] ?? null : null;
+
   const allOrgUrls = useMemo(() => {
-    if (!activeOrg) return [];
     const list: string[] = [];
-    for (const p of activeOrg.projects) {
+    for (const p of sortedProjects) {
       for (const u of p.urls) {
         list.push(u);
       }
     }
     return Array.from(new Set(list));
-  }, [activeOrg]);
+  }, [sortedProjects]);
 
   const allLatestOrgResults = useMemo(() => {
-    if (!activeOrg) return [];
     const results: SiteCheckResult[] = [];
-    for (const project of activeOrg.projects) {
+    for (const project of sortedProjects) {
       if (project.lastResults) {
         results.push(...project.lastResults);
       }
     }
     return results;
-  }, [activeOrg]);
+  }, [sortedProjects]);
 
   const handleCreateOrg = (e: FormEvent) => {
     e.preventDefault();
@@ -114,29 +213,52 @@ export function OrganisationView({
       name: trimmed,
       projects: [],
       autoRefreshSec: 0,
+      checkWindow: { ...DEFAULT_CHECK_WINDOW },
       createdAt: new Date().toISOString(),
     };
     const next = [created, ...organisations];
     onSaveOrganisations(next);
     setNewOrgName('');
     setErrorMessage(null);
-    setOpenedOrgId(created.id);
+    onChangeOpenedOrgId(created.id);
   };
 
   const handleDeleteOrg = (orgId: string) => {
     const next = organisations.filter((o) => o.id !== orgId);
     onSaveOrganisations(next);
     if (openedOrgId === orgId) {
-      setOpenedOrgId(null);
+      onChangeOpenedOrgId(null);
     }
   };
 
   const handleSetOrgAutoRefresh = (intervalSec: AutoRefreshInterval) => {
     if (!activeOrg) return;
+    setCustomPeriodError(null);
     const nextOrgs = organisations.map((o) =>
       o.id === activeOrg.id ? { ...o, autoRefreshSec: intervalSec } : o,
     );
     onSaveOrganisations(nextOrgs);
+  };
+
+  const handleSetOrgCheckWindow = (checkWindow: CheckTimeWindow) => {
+    if (!activeOrg) return;
+    const nextOrgs = organisations.map((o) =>
+      o.id === activeOrg.id ? { ...o, checkWindow } : o,
+    );
+    onSaveOrganisations(nextOrgs);
+  };
+
+  const handleApplyCustomOrgPeriod = (e: FormEvent) => {
+    e.preventDefault();
+    if (!activeOrg) return;
+    const parsed = parseCustomIntervalSeconds(customPeriodVal, customPeriodUnit);
+    if (!parsed) {
+      setCustomPeriodError('Enter a timer between 1 min and 24 hr.');
+      return;
+    }
+    setCustomPeriodError(null);
+    handleSetOrgAutoRefresh(parsed);
+    setCustomPeriodVal('');
   };
 
   const handleSaveProject = (e: FormEvent) => {
@@ -150,19 +272,21 @@ export function OrganisationView({
     }
     setErrorMessage(null);
 
-    const updatedProjects: ProjectRecord[] = editingProjectId
-      ? activeOrg.projects.map((p) =>
-          p.id === editingProjectId ? { ...p, name: trimmedName, urls: parsedUrls } : p,
-        )
-      : [
-          {
-            id: crypto.randomUUID(),
-            name: trimmedName,
-            urls: parsedUrls,
-            createdAt: new Date().toISOString(),
-          },
-          ...activeOrg.projects,
-        ];
+    const updatedProjects: ProjectRecord[] = sortProjectsByName(
+      editingProjectId
+        ? activeOrg.projects.map((p) =>
+            p.id === editingProjectId ? { ...p, name: trimmedName, urls: parsedUrls } : p,
+          )
+        : [
+            {
+              id: crypto.randomUUID(),
+              name: trimmedName,
+              urls: parsedUrls,
+              createdAt: new Date().toISOString(),
+            },
+            ...activeOrg.projects,
+          ],
+    );
 
     const nextOrgs = organisations.map((o) =>
       o.id === activeOrg.id ? { ...o, projects: updatedProjects } : o,
@@ -197,145 +321,148 @@ export function OrganisationView({
 
   const handleRunProject = async (project: ProjectRecord) => {
     if (!activeOrg || project.urls.length === 0 || runningScope) return;
-    setRunningScope(project.id);
     setErrorMessage(null);
     try {
-      const results = await onRunBatchUrls(project.urls);
-      const checkedAt = new Date().toISOString();
-      const nextOrgs = organisations.map((o) =>
-        o.id === activeOrg.id
-          ? {
-              ...o,
-              projects: o.projects.map((p) =>
-                p.id === project.id ? { ...p, lastResults: results, lastCheckedAt: checkedAt } : p,
-              ),
-            }
-          : o,
-      );
-      onSaveOrganisations(nextOrgs);
+      await onRunOrgProject(activeOrg.id, project.id);
     } catch (err: unknown) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to run project check.');
-    } finally {
-      setRunningScope(null);
     }
   };
 
-  const handleRunAllInOrg = useCallback(async () => {
+  const handleRunAllInOrg = async () => {
     if (!activeOrg || allOrgUrls.length === 0 || runningScope) return;
-    setRunningScope('all');
     setErrorMessage(null);
-
     try {
-      const chunkResults: SiteCheckResult[] = [];
-      for (let i = 0; i < allOrgUrls.length; i += 60) {
-        const chunk = allOrgUrls.slice(i, i + 60);
-        const batch = await onRunBatchUrls(chunk);
-        chunkResults.push(...batch);
-      }
-
-      const byInput = new Map<string, SiteCheckResult>();
-      for (const r of chunkResults) {
-        byInput.set(r.inputUrl, r);
-      }
-
-      const checkedAt = new Date().toISOString();
-      const nextOrgs = organisations.map((o) =>
-        o.id === activeOrg.id
-          ? {
-              ...o,
-              projects: o.projects.map((p) => ({
-                ...p,
-                lastCheckedAt: checkedAt,
-                lastResults: p.urls
-                  .map((u) => byInput.get(u))
-                  .filter((item): item is SiteCheckResult => Boolean(item)),
-              })),
-            }
-          : o,
-      );
-      onSaveOrganisations(nextOrgs);
+      await onRunOrgAll(activeOrg.id);
     } catch (err: unknown) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to run all organisation URLs.');
-    } finally {
-      setRunningScope(null);
     }
-  }, [activeOrg, allOrgUrls, onRunBatchUrls, onSaveOrganisations, organisations, runningScope]);
-
-  // Organisation Auto-Refresh Countdown & Next Cycle Timer
-  const runAllRef = useRef(handleRunAllInOrg);
-  useEffect(() => {
-    runAllRef.current = handleRunAllInOrg;
-  }, [handleRunAllInOrg]);
+  };
 
   const activeIntervalSec = activeOrg?.autoRefreshSec ?? 0;
+  const activeWindow = activeOrg?.checkWindow ?? DEFAULT_CHECK_WINDOW;
+  const inActiveWindow = isWithinCheckWindow(activeWindow, new Date(nowMs));
+  const activeTargetMs = activeOrg ? orgNextRunAt[activeOrg.id] : undefined;
 
   useEffect(() => {
-    if (!activeOrg || activeIntervalSec <= 0 || allOrgUrls.length === 0) {
-      setCountdownSec(null);
-      setNextCycleAt(null);
+    if (!activeOrg || activeIntervalSec <= 0 || allOrgUrls.length === 0 || !activeTargetMs) {
+      return;
+    }
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeOrg?.id, activeIntervalSec, allOrgUrls.length, activeTargetMs]);
+
+  const countdownSec =
+    activeOrg && activeIntervalSec > 0 && allOrgUrls.length > 0 && activeTargetMs
+      ? Math.max(0, Math.ceil((activeTargetMs - nowMs) / 1000))
+      : null;
+
+  const nextCycleAt =
+    activeTargetMs && activeIntervalSec > 0 && allOrgUrls.length > 0
+      ? new Date(activeTargetMs).toLocaleTimeString(undefined, {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+      : null;
+
+  const isPresetInterval = AUTO_REFRESH_PRESETS.some((p) => p.value === activeIntervalSec);
+
+  const isCompact = settings.density === 'compact';
+
+  const handleBulkImportProjects = (payload: {
+    targetOrgId: string | null;
+    newOrgName: string;
+    drafts: ImportedProjectDraft[];
+    mergeMatchingNames: boolean;
+  }) => {
+    if (payload.drafts.length === 0) return;
+
+    if (payload.targetOrgId) {
+      const nextOrgs = organisations.map((org) =>
+        org.id === payload.targetOrgId
+          ? {
+              ...org,
+              projects: mergeImportedProjects(
+                org.projects,
+                payload.drafts,
+                payload.mergeMatchingNames,
+              ),
+            }
+          : org,
+      );
+      onSaveOrganisations(nextOrgs);
+      if (openedOrgId !== payload.targetOrgId) {
+        onChangeOpenedOrgId(payload.targetOrgId);
+      }
+      showShareNotice(
+        `Imported ${payload.drafts.length} ${
+          payload.drafts.length === 1 ? 'project' : 'projects'
+        }.`,
+      );
       return;
     }
 
-    let targetTimeMs = Date.now() + activeIntervalSec * 1000;
-    const formatNextTime = (ms: number) =>
-      new Date(ms).toLocaleTimeString(undefined, {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      });
-
-    setCountdownSec(activeIntervalSec);
-    setNextCycleAt(formatNextTime(targetTimeMs));
-
-    const timer = window.setInterval(() => {
-      const remaining = Math.max(0, Math.ceil((targetTimeMs - Date.now()) / 1000));
-      if (remaining <= 0) {
-        targetTimeMs = Date.now() + activeIntervalSec * 1000;
-        setCountdownSec(activeIntervalSec);
-        setNextCycleAt(formatNextTime(targetTimeMs));
-        void runAllRef.current();
-      } else {
-        setCountdownSec(remaining);
-      }
-    }, 1000);
-
-    return () => window.clearInterval(timer);
-  }, [activeOrg?.id, activeIntervalSec, allOrgUrls.length]);
-
-  const isCompact = settings.density === 'compact';
+    const newOrgId = crypto.randomUUID();
+    const createdOrg: Organisation = {
+      id: newOrgId,
+      name: payload.newOrgName.trim() || 'Imported Organisation',
+      projects: mergeImportedProjects([], payload.drafts, payload.mergeMatchingNames),
+      autoRefreshSec: 0,
+      checkWindow: { ...DEFAULT_CHECK_WINDOW },
+      createdAt: new Date().toISOString(),
+    };
+    onSaveOrganisations([createdOrg, ...organisations]);
+    onChangeOpenedOrgId(newOrgId);
+  };
 
   // LEVEL 1: Organisation Directory View (click an org to open its projects & URLs)
   if (!activeOrg) {
     return (
-      <div className="flex-1 flex flex-col min-w-0 h-full overflow-y-auto p-6 lg:p-8 space-y-6">
-        <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] p-5 flex flex-wrap items-center justify-between gap-4">
-          <div className="space-y-0.5">
-            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-              Company Organisations
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Create an organisation or select one below to manage its projects, URLs, and auto-refresh schedule.
-            </p>
-          </div>
+      <>
+        <div className="flex-1 flex flex-col min-w-0 h-full overflow-y-auto p-6 lg:p-8 space-y-6">
+          <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] p-5 flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-0.5">
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Company Organisations
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Create an organisation, bulk import projects, or select an organisation below to manage its projects and URLs.
+              </p>
+            </div>
 
-          <form onSubmit={handleCreateOrg} className="flex items-center gap-2">
-            <input
-              type="text"
-              value={newOrgName}
-              onChange={(e) => setNewOrgName(e.target.value)}
-              placeholder="New organisation name"
-              className="w-48 sm:w-56 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
-            />
-            <button
-              type="submit"
-              disabled={!newOrgName.trim()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
-            >
-              <Plus className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
-              <span>Create Org</span>
-            </button>
-          </form>
-        </section>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkImportOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.07] hover:bg-slate-200 dark:hover:bg-white/[0.12] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <FolderInput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Bulk Import</span>
+              </button>
+
+              <form onSubmit={handleCreateOrg} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newOrgName}
+                  onChange={(e) => setNewOrgName(e.target.value)}
+                  placeholder="New organisation name"
+                  className="w-48 sm:w-56 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                />
+                <button
+                  type="submit"
+                  disabled={!newOrgName.trim()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+                >
+                  <Plus className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
+                  <span>Create Org</span>
+                </button>
+              </form>
+            </div>
+          </section>
 
         {organisations.length === 0 ? (
           <section className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-white/70 dark:bg-[#171A28]/60 px-6 py-14 text-center space-y-3">
@@ -365,17 +492,16 @@ export function OrganisationView({
                 }
               }
 
-              const scheduleLabel =
-                AUTO_REFRESH_OPTIONS.find((o) => o.value === (org.autoRefreshSec ?? 0))?.label ||
-                'Off';
+              const scheduleLabel = formatIntervalLabel(org.autoRefreshSec ?? 0);
+              const windowLabel = formatCheckWindowLabel(org.checkWindow);
 
               return (
                 <button
                   key={org.id}
                   type="button"
                   onClick={() => {
-                    setOpenedOrgId(org.id);
-                    setStatusFilter('all');
+                    onChangeOpenedOrgId(org.id);
+                    onChangeStatusFilter('all');
                     setErrorMessage(null);
                   }}
                   className="w-full text-left rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1C2032] px-5 py-4 flex items-center justify-between gap-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
@@ -389,7 +515,7 @@ export function OrganisationView({
                         {org.name}
                       </p>
                       <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums mt-0.5 truncate">
-                        {org.projects.length} {org.projects.length === 1 ? 'project' : 'projects'} · {uniqueUrls.size} {uniqueUrls.size === 1 ? 'URL' : 'URLs'} · Auto-refresh: {scheduleLabel}
+                        {org.projects.length} {org.projects.length === 1 ? 'project' : 'projects'} · {uniqueUrls.size} {uniqueUrls.size === 1 ? 'URL' : 'URLs'} · Timer: {scheduleLabel} · {windowLabel}
                       </p>
                     </div>
                   </div>
@@ -415,7 +541,16 @@ export function OrganisationView({
             })}
           </section>
         )}
-      </div>
+        </div>
+        <BulkImportModal
+          open={bulkImportOpen}
+          organisations={organisations}
+          initialTargetOrgId={null}
+          defaultProtocol={settings.defaultProtocol}
+          onClose={() => setBulkImportOpen(false)}
+          onConfirmImport={handleBulkImportProjects}
+        />
+      </>
     );
   }
 
@@ -428,7 +563,7 @@ export function OrganisationView({
           <button
             type="button"
             onClick={() => {
-              setOpenedOrgId(null);
+              onChangeOpenedOrgId(null);
               setEditingProjectId(null);
               setProjectName('');
               setProjectUrlsInput('');
@@ -446,7 +581,7 @@ export function OrganisationView({
             </h2>
             <button
               type="button"
-              onClick={() => handleDeleteOrg(activeOrg.id)}
+              onClick={() => setPendingConfirm({ kind: 'delete-org', org: activeOrg })}
               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 hover:bg-rose-500/10 transition-colors whitespace-nowrap shrink-0"
             >
               <Trash2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
@@ -459,6 +594,29 @@ export function OrganisationView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {shareNotice && (
+            <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+              {shareNotice}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setBulkImportOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+          >
+            <FolderInput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+            <span>Bulk Import</span>
+          </button>
+          {sortedProjects.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setExportProjectsOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+            >
+              <FileOutput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+              <span>Export Projects</span>
+            </button>
+          )}
           {allLatestOrgResults.length > 0 && (
             <>
               <button
@@ -487,6 +645,40 @@ export function OrganisationView({
                 <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
                 <span>Export PDF</span>
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                  void shareResultsPdf(
+                    allLatestOrgResults,
+                    `upsite-${slug}`,
+                    `${activeOrg.name} — Availability Report`,
+                  )
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Unable to share PDF.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Share2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Share PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+                  void copyResultsReport(
+                    allLatestOrgResults,
+                    `upsite-${slug}`,
+                    `${activeOrg.name} — Availability Report`,
+                  )
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Clipboard copy unavailable.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Copy Report</span>
+              </button>
             </>
           )}
 
@@ -506,49 +698,108 @@ export function OrganisationView({
         </div>
       </section>
 
-      {/* Auto-Refresh Schedule & Live Countdown / Next Cycle */}
-      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] px-5 py-4 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3 min-w-0">
-          <Clock className="w-4 h-4 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.75} />
-          <div className="min-w-0">
-            <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-              Auto-Refresh Schedule
-            </p>
-            {activeIntervalSec > 0 && allOrgUrls.length > 0 && countdownSec !== null ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
-                Countdown: {formatCountdown(countdownSec)} · Next cycle: {nextCycleAt}
+      {/* Check Timer (Frequency) & Active Time Period (Day & Time Range) */}
+      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] px-5 py-4 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <Clock className="w-4 h-4 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.75} />
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                Check Timer ({formatIntervalLabel(activeIntervalSec)})
               </p>
-            ) : activeIntervalSec > 0 ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Add at least one project URL to start the auto-refresh countdown.
-              </p>
-            ) : (
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Automatically re-run all projects in {activeOrg.name} on a fixed cycle.
-              </p>
-            )}
+              {activeIntervalSec > 0 && allOrgUrls.length > 0 && countdownSec !== null && nextCycleAt ? (
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                  {inActiveWindow
+                    ? `Countdown: ${formatCountdown(countdownSec)} · Next cycle: ${nextCycleAt}`
+                    : `Paused outside time period (${formatCheckWindowLabel(activeWindow)})`}
+                </p>
+              ) : activeIntervalSec > 0 ? (
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Add at least one project URL to start the check timer.
+                </p>
+              ) : (
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Set how frequently {activeOrg.name} should check all projects automatically.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div
+            role="group"
+            aria-label="Organisation check timer presets"
+            className="inline-flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.07]"
+          >
+            {AUTO_REFRESH_PRESETS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => handleSetOrgAutoRefresh(opt.value)}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium tabular-nums transition-colors whitespace-nowrap shrink-0 ${
+                  activeIntervalSec === opt.value
+                    ? 'bg-white dark:bg-white/[0.12] text-slate-900 dark:text-white'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
         </div>
 
-        <div
-          role="group"
-          aria-label="Organisation auto-refresh interval"
-          className="inline-flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.07]"
+        <form
+          onSubmit={handleApplyCustomOrgPeriod}
+          className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-white/[0.06]"
         >
-          {AUTO_REFRESH_OPTIONS.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => handleSetOrgAutoRefresh(opt.value)}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium tabular-nums transition-colors whitespace-nowrap shrink-0 ${
-                activeIntervalSec === opt.value
-                  ? 'bg-white dark:bg-white/[0.12] text-slate-900 dark:text-white'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-              }`}
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            {!isPresetInterval && activeIntervalSec > 0
+              ? `Custom timer active: Every ${formatIntervalLabel(activeIntervalSec)}`
+              : 'Custom timer frequency (1 min – 24 hr)'}
+          </span>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              max={customPeriodUnit === 'hr' ? 24 : 1440}
+              value={customPeriodVal}
+              onChange={(e) => {
+                setCustomPeriodVal(e.target.value);
+                setCustomPeriodError(null);
+              }}
+              placeholder="e.g. 15"
+              aria-label="Organisation custom timer frequency value"
+              className="w-24 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-1.5 text-xs font-mono tabular-nums text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
+            />
+            <select
+              aria-label="Organisation custom timer frequency unit"
+              value={customPeriodUnit}
+              onChange={(e) => setCustomPeriodUnit(e.target.value as 'min' | 'hr')}
+              className="rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
             >
-              {opt.label}
+              <option value="min">min</option>
+              <option value="hr">hr</option>
+            </select>
+            <button
+              type="submit"
+              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.1] dark:hover:bg-white/[0.16] text-white transition-colors whitespace-nowrap shrink-0"
+            >
+              Set Timer
             </button>
-          ))}
+          </div>
+        </form>
+
+        {customPeriodError && (
+          <p className="text-xs text-rose-600 dark:text-rose-400">{customPeriodError}</p>
+        )}
+
+        <div className="pt-3 border-t border-slate-200 dark:border-white/[0.06]">
+          <CheckWindowPicker
+            title="Check Time Period"
+            description="Select start and end day and time (e.g. Monday 12:00 AM to Sunday 11:59 PM) for when timer checks execute."
+            value={activeOrg.checkWindow}
+            onChange={handleSetOrgCheckWindow}
+          />
         </div>
       </section>
 
@@ -634,19 +885,27 @@ export function OrganisationView({
       {/* Filter Bar */}
       {allLatestOrgResults.length > 0 && (
         <div className="flex items-center justify-between gap-4">
-          <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#171A28] border border-slate-200 dark:border-white/[0.07]">
-            {(['all', 'online', 'offline', 'error'] as const).map((tab) => (
+          <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#171A28] border border-slate-200 dark:border-white/[0.07]">
+            {(
+              [
+                { id: 'all', label: 'All' },
+                { id: 'issues', label: 'Issues' },
+                { id: 'online', label: 'Online' },
+                { id: 'offline', label: 'Offline' },
+                { id: 'error', label: 'Error' },
+              ] as const
+            ).map((tab) => (
               <button
-                key={tab}
+                key={tab.id}
                 type="button"
-                onClick={() => setStatusFilter(tab)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium capitalize transition-colors whitespace-nowrap shrink-0 ${
-                  statusFilter === tab
+                onClick={() => onChangeStatusFilter(tab.id)}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  statusFilter === tab.id
                     ? 'bg-slate-900 text-white dark:bg-white/[0.1] dark:text-white'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                 }`}
               >
-                {tab}
+                {tab.label}
               </button>
             ))}
           </div>
@@ -660,7 +919,7 @@ export function OrganisationView({
         </div>
       ) : (
         <div className="space-y-3">
-          {activeOrg.projects.map((project) => {
+          {sortedProjects.map((project) => {
             const isCollapsed = Boolean(collapsedProjectIds[project.id]);
             const resultsByInput = new Map<string, SiteCheckResult>();
             for (const r of project.lastResults || []) {
@@ -677,8 +936,14 @@ export function OrganisationView({
             const visibleUrls = project.urls.filter((u) => {
               if (statusFilter === 'all') return true;
               const res = resultsByInput.get(u);
-              return res ? res.status === statusFilter : false;
+              if (!res) return false;
+              if (statusFilter === 'issues') return res.status !== 'online';
+              return res.status === statusFilter;
             });
+
+            const lastCheckedLabel = formatLastCheckedAt(
+              project.lastCheckedAt || project.lastResults?.[0]?.checkedAt,
+            );
 
             return (
               <section
@@ -709,6 +974,9 @@ export function OrganisationView({
                         {project.urls.length} {project.urls.length === 1 ? 'URL' : 'URLs'}
                         {project.lastResults && project.lastResults.length > 0
                           ? ` · ${onlineCount} Online · ${issueCount} Issue`
+                          : ''}
+                        {lastCheckedLabel
+                          ? ` · Last checked: ${lastCheckedLabel}`
                           : ' · Not checked yet'}
                       </p>
                     </div>
@@ -738,7 +1006,7 @@ export function OrganisationView({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleDeleteProject(project.id)}
+                      onClick={() => setPendingConfirm({ kind: 'delete-project', project })}
                       aria-label={`Delete ${project.name}`}
                       className="p-1.5 rounded-lg text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 hover:bg-rose-500/10 transition-colors shrink-0"
                     >
@@ -847,6 +1115,169 @@ export function OrganisationView({
           })}
         </div>
       )}
+
+      {/* Post-Run Simple Report Download Prompt */}
+      {pendingReport && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="org-report-prompt-title"
+          className="fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-[1px] flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-2xl p-6 space-y-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h3
+                  id="org-report-prompt-title"
+                  className="text-sm font-semibold text-slate-900 dark:text-slate-100"
+                >
+                  Check Complete — Download Simple Report
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {pendingReport.orgName} · {pendingReport.scopeLabel}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onDismissPendingReport}
+                aria-label="Cancel report download"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/[0.06]"
+              >
+                <X className="w-4 h-4" strokeWidth={1.75} />
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-slate-50 dark:bg-[#10121C] px-4 py-3 flex items-center justify-between gap-4 text-xs font-mono tabular-nums">
+              <span className="text-slate-600 dark:text-slate-300">
+                Total: {pendingReport.rows.length}
+              </span>
+              <span className="text-emerald-600 dark:text-emerald-400">
+                Online: {pendingReport.onlineCount}
+              </span>
+              <span className="text-rose-600 dark:text-rose-400">
+                Down: {pendingReport.downCount}
+              </span>
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              Would you like to download, share, or copy a simple report covering all {pendingReport.rows.length} checked {pendingReport.rows.length === 1 ? 'site' : 'sites'} now?
+            </p>
+
+            {modalShareNotice && (
+              <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                {modalShareNotice}
+              </p>
+            )}
+
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={onDismissPendingReport}
+                className="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors whitespace-nowrap shrink-0"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void copySimpleOrgReport(pendingReport.orgName, pendingReport.rows)
+                    .then(showModalShareNotice)
+                    .catch(() => showModalShareNotice('Clipboard copy unavailable.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.08] hover:bg-slate-200 dark:hover:bg-white/[0.14] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Copy Report</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void shareSimpleOrgReportPdf(pendingReport.orgName, pendingReport.rows)
+                    .then(showModalShareNotice)
+                    .catch(() => showModalShareNotice('Unable to share PDF.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.08] hover:bg-slate-200 dark:hover:bg-white/[0.14] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Share2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Share PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  exportSimpleOrgReportPdf(pendingReport.orgName, pendingReport.rows);
+                  onDismissPendingReport();
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.08] hover:bg-slate-200 dark:hover:bg-white/[0.14] transition-colors whitespace-nowrap shrink-0"
+              >
+                <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Download PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  exportSimpleOrgReportCsv(pendingReport.orgName, pendingReport.rows);
+                  onDismissPendingReport();
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0"
+              >
+                <Download className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Download CSV</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmModal
+        open={pendingConfirm !== null}
+        title={
+          pendingConfirm?.kind === 'delete-org'
+            ? `Delete Organisation "${pendingConfirm.org.name}"?`
+            : pendingConfirm?.kind === 'delete-project'
+              ? `Delete Project "${pendingConfirm.project.name}"?`
+              : ''
+        }
+        description={
+          pendingConfirm?.kind === 'delete-org'
+            ? `This will permanently delete "${pendingConfirm.org.name}" along with its ${
+                pendingConfirm.org.projects.length
+              } ${pendingConfirm.org.projects.length === 1 ? 'project' : 'projects'} and all saved URLs.`
+            : pendingConfirm?.kind === 'delete-project'
+              ? `This will permanently remove "${pendingConfirm.project.name}" and its ${
+                  pendingConfirm.project.urls.length
+                } ${pendingConfirm.project.urls.length === 1 ? 'URL' : 'URLs'} from ${
+                  activeOrg?.name || 'this organisation'
+                }.`
+              : ''
+        }
+        confirmLabel={pendingConfirm?.kind === 'delete-org' ? 'Delete Organisation' : 'Delete Project'}
+        tone="danger"
+        onConfirm={() => {
+          if (pendingConfirm?.kind === 'delete-org') {
+            handleDeleteOrg(pendingConfirm.org.id);
+          } else if (pendingConfirm?.kind === 'delete-project') {
+            handleDeleteProject(pendingConfirm.project.id);
+          }
+          setPendingConfirm(null);
+        }}
+        onCancel={() => setPendingConfirm(null)}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        organisations={organisations}
+        initialTargetOrgId={activeOrg.id}
+        defaultProtocol={settings.defaultProtocol}
+        onClose={() => setBulkImportOpen(false)}
+        onConfirmImport={handleBulkImportProjects}
+      />
+
+      <ExportProjectsModal
+        open={exportProjectsOpen}
+        orgName={activeOrg.name}
+        projects={sortedProjects}
+        onClose={() => setExportProjectsOpen(false)}
+      />
     </div>
   );
 }

@@ -17,10 +17,14 @@ import {
   loginWithAccessToken,
   loginWithCredentials,
   registerWithToken,
+  sanitizeCheckWindow,
+  saveUserCheckerInput,
   saveUserOrganisations,
+  SESSION_REMEMBER_TTL_MS,
   updateUserSettings,
   verifySessionToken,
 } from './server/store.ts';
+import { sortProjectsByName } from './src/utils/organisations.ts';
 import type {
   AutoRefreshInterval,
   CheckOptions,
@@ -861,8 +865,12 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
 }
 
 function sanitizeAutoRefresh(val: unknown): AutoRefreshInterval {
-  if (val === 300 || val === 600 || val === 3600 || val === 14400) {
-    return val;
+  if (val === 0) return 0;
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    const rounded = Math.round(val);
+    if (rounded >= 60 && rounded <= 86400) {
+      return rounded;
+    }
   }
   return 0;
 }
@@ -900,12 +908,11 @@ export async function createServer() {
       return;
     }
 
-    const rememberMe = body.rememberMe !== false;
     const result = registerWithToken({
       username: body.username,
       password: body.password,
       accessToken: body.accessToken,
-      rememberMe,
+      rememberMe: true,
     });
 
     if (!result.ok) {
@@ -913,11 +920,7 @@ export async function createServer() {
       return;
     }
 
-    if (rememberMe) {
-      setSessionCookie(req, res, result.sessionToken, result.ttlMs);
-    } else {
-      clearSessionCookie(req, res);
-    }
+    setSessionCookie(req, res, result.sessionToken, result.ttlMs);
 
     const profile = getUserProfileAndWorkspace(result.user.id);
     res.status(201).json({
@@ -1000,6 +1003,15 @@ export async function createServer() {
       res.status(404).json({ error: 'User not found.' });
       return;
     }
+    const authHeader = req.headers.authorization;
+    const cookies = parseCookies(req.headers.cookie);
+    const activeToken =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : cookies[SESSION_COOKIE_NAME];
+    if (activeToken) {
+      setSessionCookie(req, res, activeToken, SESSION_REMEMBER_TTL_MS);
+    }
     res.json(profile);
   });
 
@@ -1068,25 +1080,28 @@ export async function createServer() {
         id: typeof org.id === 'string' && org.id ? org.id : crypto.randomUUID(),
         name: typeof org.name === 'string' ? org.name.trim().slice(0, 80) : 'Untitled Organisation',
         autoRefreshSec: sanitizeAutoRefresh(org.autoRefreshSec),
+        checkWindow: sanitizeCheckWindow(org.checkWindow),
         createdAt: typeof org.createdAt === 'string' ? org.createdAt : new Date().toISOString(),
         projects: Array.isArray(org.projects)
-          ? org.projects
-              .filter((p) => Boolean(p && typeof p === 'object'))
-              .slice(0, 100)
-              .map((p) => ({
-                id: typeof p.id === 'string' && p.id ? p.id : crypto.randomUUID(),
-                name: typeof p.name === 'string' ? p.name.trim().slice(0, 80) : 'Untitled Project',
-                urls: Array.isArray(p.urls)
-                  ? p.urls
-                      .filter((u): u is string => typeof u === 'string')
-                      .map((u) => u.trim())
-                      .filter(Boolean)
-                      .slice(0, 50)
-                  : [],
-                lastResults: Array.isArray(p.lastResults) ? p.lastResults.slice(0, 50) : undefined,
-                lastCheckedAt: typeof p.lastCheckedAt === 'string' ? p.lastCheckedAt : undefined,
-                createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
-              }))
+          ? sortProjectsByName(
+              org.projects
+                .filter((p) => Boolean(p && typeof p === 'object'))
+                .slice(0, 100)
+                .map((p) => ({
+                  id: typeof p.id === 'string' && p.id ? p.id : crypto.randomUUID(),
+                  name: typeof p.name === 'string' ? p.name.trim().slice(0, 80) : 'Untitled Project',
+                  urls: Array.isArray(p.urls)
+                    ? p.urls
+                        .filter((u): u is string => typeof u === 'string')
+                        .map((u) => u.trim())
+                        .filter(Boolean)
+                        .slice(0, 50)
+                    : [],
+                  lastResults: Array.isArray(p.lastResults) ? p.lastResults.slice(0, 50) : undefined,
+                  lastCheckedAt: typeof p.lastCheckedAt === 'string' ? p.lastCheckedAt : undefined,
+                  createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
+                })),
+            )
           : [],
       }));
 
@@ -1110,6 +1125,20 @@ export async function createServer() {
     }
     const updated = updateUserSettings(req.userId, body.settings);
     res.json({ settings: updated });
+  });
+
+  app.put('/api/checker-input', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const body = req.body as { checkerInput?: unknown };
+    if (typeof body?.checkerInput !== 'string') {
+      res.status(400).json({ error: 'Invalid checker input payload.' });
+      return;
+    }
+    if (!req.userId) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    const checkerInput = saveUserCheckerInput(req.userId, body.checkerInput);
+    res.json({ checkerInput });
   });
 
   const isProd = process.env.NODE_ENV === 'production';

@@ -4,15 +4,23 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock,
+  Copy,
   Download,
   FileText,
   Search,
+  Share2,
   Trash2,
   XCircle,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { SiteCheckResult, SiteStatus, UserSettings } from '../types/upsite';
-import { exportResultsToCsv, exportResultsToPdf } from '../utils/exporters';
+import {
+  copyResultsReport,
+  exportResultsToCsv,
+  exportResultsToPdf,
+  shareResultsPdf,
+} from '../utils/exporters';
+import { ConfirmModal } from './ConfirmModal';
 
 interface HistoryViewProps {
   history: SiteCheckResult[];
@@ -36,6 +44,15 @@ export function HistoryView({
   const [statusFilter, setStatusFilter] = useState<'all' | SiteStatus>('all');
   const [dateSort, setDateSort] = useState<DateSortOrder>('newest');
   const [dateRange, setDateRange] = useState<DateRangeFilter>('all');
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [shareNotice, setShareNotice] = useState<string | null>(null);
+
+  const showShareNotice = (msg: string) => {
+    setShareNotice(msg);
+    window.setTimeout(() => {
+      setShareNotice((prev) => (prev === msg ? null : prev));
+    }, 3000);
+  };
 
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -159,13 +176,37 @@ export function HistoryView({
                 <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
                 <span>Export PDF</span>
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void shareResultsPdf(filtered, 'upsite-history', 'upsite Check History Report')
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Unable to share PDF.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Share2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Share PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void copyResultsReport(filtered, 'upsite-history', 'upsite Check History Report')
+                    .then(showShareNotice)
+                    .catch(() => showShareNotice('Clipboard copy unavailable.'));
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>Copy Report</span>
+              </button>
             </>
           )}
 
           {history.length > 0 && (
             <button
               type="button"
-              onClick={onClearHistory}
+              onClick={() => setConfirmClearOpen(true)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-300 bg-white dark:bg-[#171A28] hover:bg-rose-500/10 border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
             >
               <Trash2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
@@ -174,6 +215,12 @@ export function HistoryView({
           )}
         </div>
       </div>
+
+      {shareNotice && (
+        <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+          {shareNotice}
+        </p>
+      )}
 
       {/* History List */}
       {filtered.length > 0 ? (
@@ -276,6 +323,20 @@ export function HistoryView({
           </div>
         </div>
       )}
+      <ConfirmModal
+        open={confirmClearOpen}
+        title="Clear All Check History?"
+        description={`This will permanently delete all ${history.length} saved check history ${
+          history.length === 1 ? 'record' : 'records'
+        } from your account.`}
+        confirmLabel="Clear History"
+        tone="danger"
+        onConfirm={() => {
+          onClearHistory();
+          setConfirmClearOpen(false);
+        }}
+        onCancel={() => setConfirmClearOpen(false)}
+      />
     </div>
   );
 }
