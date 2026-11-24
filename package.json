@@ -2,6 +2,8 @@
   "name": "upsite",
   "private": true,
   "version": "1.0.0",
+  "description": "Website availability monitor and bulk URL diagnostic tool",
+  "author": "upsite",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

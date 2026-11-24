@@ -33,7 +33,7 @@ jobs:
 
       - name: Package Windows .exe installer & portable binary
         run: |
-          npx electron-builder --win nsis portable `
+          npx electron-builder --win nsis portable --publish never `
             --config.appId=com.upsite.desktop `
             --config.productName=upsite `
             --config.directories.output=release `
