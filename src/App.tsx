@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS: UserSettings = {
 export default function App() {
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
 
   const [activeView, setActiveView] = useState<ActiveView>('checker');
   const [urlInput, setUrlInput] = useState<string>('');
@@ -47,9 +48,14 @@ export default function App() {
   const authHeaders = useCallback(
     (tokenOverride?: string): Record<string, string> => {
       const tok = tokenOverride ?? sessionToken;
-      return tok
-        ? { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` }
-        : { 'Content-Type': 'application/json' };
+      const base: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'upsite-app',
+      };
+      if (tok) {
+        base.Authorization = `Bearer ${tok}`;
+      }
+      return base;
     },
     [sessionToken],
   );
@@ -59,7 +65,45 @@ export default function App() {
     document.documentElement.classList.toggle('dark', settings.theme === 'dark');
   }, [settings.theme]);
 
+  // Restore remembered HttpOnly cookie session on launch/refresh
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/auth/me', {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'X-Requested-With': 'upsite-app' },
+        });
+        if (!active || !res.ok) return;
+        const data = await res.json();
+        if (active && data?.user) {
+          setCurrentUser(data.user);
+          if (data.workspace) {
+            setHistory(data.workspace.history || []);
+            setOrganisations(data.workspace.organisations || []);
+            setSettings({ ...DEFAULT_SETTINGS, ...(data.workspace.settings || {}) });
+          }
+        }
+      } catch {
+        // Proceed to login portal if no active session
+      } finally {
+        if (active) {
+          setIsRestoringSession(false);
+        }
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const handleSignOut = useCallback(() => {
+    void fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'upsite-app' },
+    }).catch(() => {});
     setSessionToken(null);
     setCurrentUser(null);
     setLatestResults([]);
@@ -73,7 +117,7 @@ export default function App() {
 
   const runCheckBatch = useCallback(
     async (urls: string[], updateCheckerState: boolean): Promise<SiteCheckResult[]> => {
-      if (!sessionToken || urls.length === 0) return [];
+      if (!currentUser || urls.length === 0) return [];
       const endpoint = urls.length === 1 ? '/api/check' : '/api/check-bulk';
       const bodyPayload = {
         ...(urls.length === 1 ? { url: urls[0] } : { urls }),
@@ -86,6 +130,7 @@ export default function App() {
 
       const response = await fetch(endpoint, {
         method: 'POST',
+        credentials: 'include',
         headers: authHeaders(),
         body: JSON.stringify(bodyPayload),
       });
@@ -132,8 +177,8 @@ export default function App() {
     },
     [
       authHeaders,
+      currentUser,
       handleSignOut,
-      sessionToken,
       settings.autoInspectFirstIssue,
       settings.deepInspect,
       settings.defaultProtocol,
@@ -166,7 +211,7 @@ export default function App() {
 
   useEffect(() => {
     if (
-      !sessionToken ||
+      !currentUser ||
       settings.autoRefreshSec <= 0 ||
       activeView !== 'checker' ||
       latestResults.length === 0 ||
@@ -193,15 +238,15 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [
     activeView,
+    currentUser,
     handleRunChecker,
     isChecking,
     latestResults.length,
-    sessionToken,
     settings.autoRefreshSec,
   ]);
 
   const handleRecheckSingle = async (url: string) => {
-    if (!sessionToken) return;
+    if (!currentUser) return;
     setIsRechecking(true);
     try {
       const items = await runCheckBatch([url], false);
@@ -223,10 +268,11 @@ export default function App() {
 
   const handleSaveOrganisations = async (nextOrgs: Organisation[]) => {
     setOrganisations(nextOrgs);
-    if (!sessionToken) return;
+    if (!currentUser) return;
     try {
       const res = await fetch('/api/organisations', {
         method: 'PUT',
+        credentials: 'include',
         headers: authHeaders(),
         body: JSON.stringify({ organisations: nextOrgs }),
       });
@@ -241,13 +287,14 @@ export default function App() {
   const handleUpdateSettings = async (partial: Partial<UserSettings>) => {
     const optimistic = { ...settings, ...partial };
     setSettings(optimistic);
-    if (!sessionToken) return;
+    if (!currentUser) return;
 
     setIsSavingSettings(true);
     setSettingsSavedNotice(false);
     try {
       const res = await fetch('/api/settings', {
         method: 'PUT',
+        credentials: 'include',
         headers: authHeaders(),
         body: JSON.stringify({ settings: partial }),
       });
@@ -277,14 +324,23 @@ export default function App() {
     if (activeView === 'history') {
       setSelectedResult(null);
     }
-    if (!sessionToken) return;
+    if (!currentUser) return;
     await fetch('/api/history', {
       method: 'DELETE',
+      credentials: 'include',
       headers: authHeaders(),
     }).catch(() => {});
   };
 
-  if (!sessionToken || !currentUser) {
+  if (isRestoringSession) {
+    return (
+      <div className="min-h-screen w-full bg-slate-100 dark:bg-[#0F111A] text-slate-600 dark:text-slate-400 flex items-center justify-center p-6">
+        <span className="text-xs font-medium tracking-wide">Restoring session...</span>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
     return (
       <LoginView
         onAuthenticated={(payload) => {

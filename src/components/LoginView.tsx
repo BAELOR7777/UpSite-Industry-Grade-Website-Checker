@@ -19,11 +19,25 @@ interface LoginViewProps {
   onAuthenticated: (payload: AuthSuccessPayload) => void;
 }
 
+const LAST_USERNAME_KEY = 'upsite_last_username';
+
+function readSavedUsername(): string {
+  try {
+    return window.localStorage.getItem(LAST_USERNAME_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
 export function LoginView({ onAuthenticated }: LoginViewProps) {
-  const [activeTab, setActiveTab] = useState<LoginTab>('token');
+  const initialSavedUsername = readSavedUsername();
+  const [activeTab, setActiveTab] = useState<LoginTab>(
+    initialSavedUsername ? 'login' : 'token',
+  );
   const [accessToken, setAccessToken] = useState('');
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(initialSavedUsername);
   const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [tokenLockedNotice, setTokenLockedNotice] = useState(false);
@@ -35,25 +49,39 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
 
     try {
       let endpoint = '/api/auth/token-login';
-      let body: Record<string, string> = { accessToken };
+      let body: Record<string, string | boolean> = { accessToken, rememberMe };
 
       if (activeTab === 'register') {
         endpoint = '/api/auth/register';
-        body = { username, password, accessToken };
+        body = { username, password, accessToken, rememberMe };
       } else if (activeTab === 'login') {
         endpoint = '/api/auth/login';
-        body = { username, password };
+        body = { username, password, rememberMe };
       }
 
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'upsite-app',
+        },
         body: JSON.stringify(body),
       });
 
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data?.error || 'Authentication failed.');
+      }
+
+      try {
+        if (rememberMe && (activeTab === 'register' || activeTab === 'login') && username.trim()) {
+          window.localStorage.setItem(LAST_USERNAME_KEY, username.trim());
+        } else if (!rememberMe) {
+          window.localStorage.removeItem(LAST_USERNAME_KEY);
+        }
+      } catch {
+        // Ignore storage quota errors
       }
 
       onAuthenticated({
@@ -183,6 +211,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
               </div>
               <input
                 id="access-token-input"
+                name="accessToken"
                 type="text"
                 maxLength={10}
                 required
@@ -206,6 +235,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 </label>
                 <input
                   id="username-input"
+                  name="username"
                   type="text"
                   required
                   autoComplete="username"
@@ -225,6 +255,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 </label>
                 <input
                   id="password-input"
+                  name="password"
                   type="password"
                   required
                   minLength={6}
@@ -237,6 +268,26 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
               </div>
             </>
           )}
+
+          <label
+            htmlFor="remember-me-checkbox"
+            className="flex items-center justify-between gap-3 pt-0.5 cursor-pointer select-none"
+          >
+            <span className="flex items-center gap-2.5 text-xs text-slate-700 dark:text-slate-300">
+              <input
+                id="remember-me-checkbox"
+                name="rememberMe"
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(e) => setRememberMe(e.target.checked)}
+                className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] bg-slate-50 dark:bg-[#10121C] text-rose-600 focus:ring-rose-500 accent-rose-600 cursor-pointer"
+              />
+              <span className="font-medium">Remember me</span>
+            </span>
+            <span className="text-[11px] text-slate-500 dark:text-slate-400">
+              Keep signed in
+            </span>
+          </label>
 
           {errorMessage && (
             <div
@@ -275,9 +326,9 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
 
         <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed pt-2 border-t border-slate-200 dark:border-white/[0.06]">
           {activeTab === 'token'
-            ? 'Access requires a valid 10-character token. Switch to Create Account to bind a username and password to save your workspace permanently.'
+            ? 'Access requires a valid 10-character token. Switch to Create Account to set up a personal username and password to save your workspace.'
             : activeTab === 'register'
-              ? 'Creating an account binds your token and saves your organisations, projects, history, and settings locally.'
+              ? 'Any valid 10-character token lets you create an account. Your credentials, organisations, history, and settings are saved locally.'
               : 'Sign in with your saved account credentials to restore your organisations and check history.'}
         </p>
       </div>

@@ -6,6 +6,20 @@ const { app, BrowserWindow, shell } = require('electron');
 let mainWindow = null;
 let httpServer = null;
 
+async function listenOnPort(expressApp, port) {
+  return new Promise((resolve, reject) => {
+    const srv = expressApp.listen(port, '127.0.0.1', () => {
+      const addr = srv.address();
+      if (!addr || typeof addr === 'string') {
+        reject(new Error('Failed to bind local port'));
+        return;
+      }
+      resolve({ server: srv, port: addr.port });
+    });
+    srv.on('error', reject);
+  });
+}
+
 async function startLocalBackend() {
   const compiledEntry = path.join(__dirname, '..', 'dist-server', 'server.mjs');
   const sourceEntry = path.join(__dirname, '..', 'server.ts');
@@ -16,17 +30,14 @@ async function startLocalBackend() {
   const mod = await import(pathToFileURL(targetPath).href);
   const expressApp = await mod.createServer();
 
-  return new Promise((resolve, reject) => {
-    const srv = expressApp.listen(0, '127.0.0.1', () => {
-      const addr = srv.address();
-      if (!addr || typeof addr === 'string') {
-        reject(new Error('Failed to bind local port'));
-        return;
-      }
-      resolve({ server: srv, port: addr.port });
-    });
-    srv.on('error', reject);
-  });
+  try {
+    return await listenOnPort(expressApp, 47381);
+  } catch (err) {
+    if (err && err.code === 'EADDRINUSE') {
+      return listenOnPort(expressApp, 0);
+    }
+    throw err;
+  }
 }
 
 async function createWindow() {

@@ -7,20 +7,15 @@ import type {
   SiteCheckResult,
   UserSettings,
 } from '../src/types/upsite.ts';
+import { hashAccessToken, isValidAccessToken } from './issuedTokens.ts';
 
 const DATA_DIR = process.env.UPSITE_DATA_DIR
   ? path.resolve(process.env.UPSITE_DATA_DIR)
   : path.resolve(process.cwd(), '.data');
 const DB_PATH = path.join(DATA_DIR, 'upsite-db.json');
-const TOKENS_EXPORT_PATH = path.join(DATA_DIR, 'tokens.txt');
 
-const SESSION_SECRET =
-  process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16
-    ? process.env.SESSION_SECRET
-    : crypto.randomBytes(32).toString('hex');
-
-const TOKEN_COUNT = 50;
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export const SESSION_SHORT_TTL_MS = 12 * 60 * 60 * 1000;
+export const SESSION_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const DEFAULT_SETTINGS: UserSettings = {
   theme: 'dark',
@@ -33,19 +28,12 @@ export const DEFAULT_SETTINGS: UserSettings = {
   deepInspect: true,
 };
 
-interface IssuedTokenRecord {
-  tokenHash: string;
-  tokenMask: string;
-  claimedByUserId: string | null;
-}
-
 interface StoredUser {
   id: string;
   username: string;
   usernameLower: string;
   passwordHash: string | null;
   authType: 'account' | 'token';
-  tokenHash: string;
   tokenMask: string;
   createdAt: string;
 }
@@ -57,48 +45,14 @@ interface UserWorkspace {
 }
 
 interface UpsiteDatabase {
-  tokens: IssuedTokenRecord[];
+  sessionSecret: string;
   users: Record<string, StoredUser>;
   workspaces: Record<string, UserWorkspace>;
-}
-
-function sha256(value: string): string {
-  return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
 function maskToken(token: string): string {
   if (token.length <= 4) return '••••';
   return `${token.slice(0, 2)}••••••${token.slice(-2)}`;
-}
-
-function generateTenCharToken(): string {
-  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-  const lower = 'abcdefghijkmnopqrstuvwxyz';
-  const digits = '23456789';
-  const symbols = '!@#$%&*?+-';
-  const all = upper + lower + digits + symbols;
-
-  const chars: string[] = [
-    upper[crypto.randomInt(upper.length)],
-    upper[crypto.randomInt(upper.length)],
-    lower[crypto.randomInt(lower.length)],
-    lower[crypto.randomInt(lower.length)],
-    digits[crypto.randomInt(digits.length)],
-    digits[crypto.randomInt(digits.length)],
-    symbols[crypto.randomInt(symbols.length)],
-    symbols[crypto.randomInt(symbols.length)],
-    all[crypto.randomInt(all.length)],
-    all[crypto.randomInt(all.length)],
-  ];
-
-  for (let i = chars.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    const tmp = chars[i];
-    chars[i] = chars[j];
-    chars[j] = tmp;
-  }
-
-  return chars.join('');
 }
 
 function hashPassword(password: string): string {
@@ -131,33 +85,12 @@ function saveDb(db: UpsiteDatabase): void {
 
 function initializeDatabase(): UpsiteDatabase {
   ensureDataDir();
-  const rawTokens: string[] = [];
-  const seen = new Set<string>();
-
-  while (rawTokens.length < TOKEN_COUNT) {
-    const t = generateTenCharToken();
-    if (!seen.has(t)) {
-      seen.add(t);
-      rawTokens.push(t);
-    }
-  }
-
   const db: UpsiteDatabase = {
-    tokens: rawTokens.map((t) => ({
-      tokenHash: sha256(t),
-      tokenMask: maskToken(t),
-      claimedByUserId: null,
-    })),
+    sessionSecret: crypto.randomBytes(32).toString('hex'),
     users: {},
     workspaces: {},
   };
-
   saveDb(db);
-  fs.writeFileSync(
-    TOKENS_EXPORT_PATH,
-    `# upsite local access tokens (50 x 10-character mixed tokens)\n${rawTokens.join('\n')}\n`,
-    'utf8',
-  );
   return db;
 }
 
@@ -167,34 +100,52 @@ function loadDb(): UpsiteDatabase {
   }
   try {
     const raw = fs.readFileSync(DB_PATH, 'utf8');
-    const parsed = JSON.parse(raw) as UpsiteDatabase;
-    if (!Array.isArray(parsed.tokens) || parsed.tokens.length === 0) {
-      return initializeDatabase();
+    const parsed = JSON.parse(raw) as Partial<UpsiteDatabase>;
+    let changed = false;
+    let sessionSecret = parsed.sessionSecret;
+    if (!sessionSecret || typeof sessionSecret !== 'string' || sessionSecret.length < 32) {
+      sessionSecret = crypto.randomBytes(32).toString('hex');
+      changed = true;
     }
-    return {
-      tokens: parsed.tokens,
+    const db: UpsiteDatabase = {
+      sessionSecret,
       users: parsed.users || {},
       workspaces: parsed.workspaces || {},
     };
+    if (changed) {
+      saveDb(db);
+    }
+    return db;
   } catch {
     return initializeDatabase();
   }
+}
+
+function getSigningSecret(): string {
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16) {
+    return process.env.SESSION_SECRET;
+  }
+  return loadDb().sessionSecret;
 }
 
 export function ensureInitialized(): void {
   loadDb();
 }
 
-export function createSessionToken(userId: string): string {
+export function createSessionToken(userId: string, rememberMe = true): {
+  token: string;
+  ttlMs: number;
+} {
+  const ttlMs = rememberMe ? SESSION_REMEMBER_TTL_MS : SESSION_SHORT_TTL_MS;
   const payload = Buffer.from(
-    JSON.stringify({ sub: userId, exp: Date.now() + SESSION_TTL_MS }),
+    JSON.stringify({ sub: userId, exp: Date.now() + ttlMs }),
     'utf8',
   ).toString('base64url');
   const sig = crypto
-    .createHmac('sha256', SESSION_SECRET)
+    .createHmac('sha256', getSigningSecret())
     .update(payload)
     .digest('base64url');
-  return `${payload}.${sig}`;
+  return { token: `${payload}.${sig}`, ttlMs };
 }
 
 export function verifySessionToken(token: string): string | null {
@@ -204,7 +155,7 @@ export function verifySessionToken(token: string): string | null {
   if (!payloadB64 || !sigB64) return null;
 
   const expectedSig = crypto
-    .createHmac('sha256', SESSION_SECRET)
+    .createHmac('sha256', getSigningSecret())
     .update(payloadB64)
     .digest('base64url');
 
@@ -259,10 +210,14 @@ export function registerWithToken(params: {
   username: string;
   password: string;
   accessToken: string;
-}): { ok: true; user: AuthUser; sessionToken: string } | { ok: false; error: string; status: number } {
+  rememberMe?: boolean;
+}):
+  | { ok: true; user: AuthUser; sessionToken: string; ttlMs: number }
+  | { ok: false; error: string; status: number } {
   const username = params.username.trim();
   const password = params.password;
   const rawToken = params.accessToken.trim();
+  const rememberMe = params.rememberMe !== false;
 
   if (username.length < 3 || username.length > 32) {
     return { ok: false, error: 'Username must be between 3 and 32 characters.', status: 400 };
@@ -280,6 +235,9 @@ export function registerWithToken(params: {
   if (rawToken.length !== 10) {
     return { ok: false, error: 'Access token must be exactly 10 characters.', status: 400 };
   }
+  if (!isValidAccessToken(rawToken)) {
+    return { ok: false, error: 'Invalid access token.', status: 401 };
+  }
 
   const db = loadDb();
   const usernameLower = username.toLowerCase();
@@ -291,32 +249,6 @@ export function registerWithToken(params: {
     return { ok: false, error: 'Username is already taken.', status: 409 };
   }
 
-  const tokenHash = sha256(rawToken);
-  const tokenRecord = db.tokens.find((t) => t.tokenHash === tokenHash);
-  if (!tokenRecord) {
-    return { ok: false, error: 'Invalid access token.', status: 401 };
-  }
-
-  if (tokenRecord.claimedByUserId) {
-    const existingOwner = db.users[tokenRecord.claimedByUserId];
-    if (existingOwner && existingOwner.authType === 'account') {
-      return { ok: false, error: 'This access token has already been used to register an account.', status: 409 };
-    }
-    // Upgrade a token-only workspace to a full saved account
-    if (existingOwner && existingOwner.authType === 'token') {
-      existingOwner.username = username;
-      existingOwner.usernameLower = usernameLower;
-      existingOwner.passwordHash = hashPassword(password);
-      existingOwner.authType = 'account';
-      saveDb(db);
-      return {
-        ok: true,
-        user: toAuthUser(existingOwner),
-        sessionToken: createSessionToken(existingOwner.id),
-      };
-    }
-  }
-
   const userId = crypto.randomUUID();
   const newUser: StoredUser = {
     id: userId,
@@ -324,12 +256,10 @@ export function registerWithToken(params: {
     usernameLower,
     passwordHash: hashPassword(password),
     authType: 'account',
-    tokenHash,
-    tokenMask: tokenRecord.tokenMask,
+    tokenMask: maskToken(rawToken),
     createdAt: new Date().toISOString(),
   };
 
-  tokenRecord.claimedByUserId = userId;
   db.users[userId] = newUser;
   db.workspaces[userId] = {
     history: [],
@@ -338,19 +268,26 @@ export function registerWithToken(params: {
   };
   saveDb(db);
 
+  const session = createSessionToken(userId, rememberMe);
   return {
     ok: true,
     user: toAuthUser(newUser),
-    sessionToken: createSessionToken(userId),
+    sessionToken: session.token,
+    ttlMs: session.ttlMs,
   };
 }
 
 export function loginWithCredentials(params: {
   username: string;
   password: string;
-}): { ok: true; user: AuthUser; sessionToken: string } | { ok: false; error: string; status: number } {
+  rememberMe?: boolean;
+}):
+  | { ok: true; user: AuthUser; sessionToken: string; ttlMs: number }
+  | { ok: false; error: string; status: number } {
   const usernameLower = params.username.trim().toLowerCase();
   const password = params.password;
+  const rememberMe = params.rememberMe !== false;
+
   if (!usernameLower || !password) {
     return { ok: false, error: 'Enter both username and password.', status: 400 };
   }
@@ -364,72 +301,60 @@ export function loginWithCredentials(params: {
     return { ok: false, error: 'Invalid username or password.', status: 401 };
   }
 
+  const session = createSessionToken(user.id, rememberMe);
   return {
     ok: true,
     user: toAuthUser(user),
-    sessionToken: createSessionToken(user.id),
+    sessionToken: session.token,
+    ttlMs: session.ttlMs,
   };
 }
 
 export function loginWithAccessToken(
   rawTokenInput: string,
-): { ok: true; user: AuthUser; sessionToken: string } | { ok: false; error: string; status: number } {
+  rememberMe = true,
+):
+  | { ok: true; user: AuthUser; sessionToken: string; ttlMs: number }
+  | { ok: false; error: string; status: number } {
   const rawToken = rawTokenInput.trim();
   if (rawToken.length !== 10) {
     return { ok: false, error: 'Access token must be exactly 10 characters.', status: 400 };
   }
-
-  const db = loadDb();
-  const tokenHash = sha256(rawToken);
-  const tokenRecord = db.tokens.find((t) => t.tokenHash === tokenHash);
-
-  if (!tokenRecord) {
+  if (!isValidAccessToken(rawToken)) {
     return { ok: false, error: 'Invalid access token.', status: 401 };
   }
 
-  if (tokenRecord.claimedByUserId) {
-    const existing = db.users[tokenRecord.claimedByUserId];
-    if (existing) {
-      if (existing.authType === 'account') {
-        return {
-          ok: false,
-          error: 'This token belongs to a saved account. Sign in with your username and password.',
-          status: 403,
-        };
-      }
-      return {
-        ok: true,
-        user: toAuthUser(existing),
-        sessionToken: createSessionToken(existing.id),
-      };
-    }
+  const db = loadDb();
+  const tokenHash = hashAccessToken(rawToken);
+  const sharedUserId = `token_${tokenHash.slice(0, 16)}`;
+
+  let tokenUser = db.users[sharedUserId];
+  if (!tokenUser) {
+    const masked = maskToken(rawToken);
+    tokenUser = {
+      id: sharedUserId,
+      username: `Token ${masked}`,
+      usernameLower: sharedUserId,
+      passwordHash: null,
+      authType: 'token',
+      tokenMask: masked,
+      createdAt: new Date().toISOString(),
+    };
+    db.users[sharedUserId] = tokenUser;
+    db.workspaces[sharedUserId] = {
+      history: [],
+      organisations: [],
+      settings: { ...DEFAULT_SETTINGS },
+    };
+    saveDb(db);
   }
 
-  const userId = crypto.randomUUID();
-  const tokenUser: StoredUser = {
-    id: userId,
-    username: `Token ${tokenRecord.tokenMask}`,
-    usernameLower: `token_${userId}`,
-    passwordHash: null,
-    authType: 'token',
-    tokenHash,
-    tokenMask: tokenRecord.tokenMask,
-    createdAt: new Date().toISOString(),
-  };
-
-  tokenRecord.claimedByUserId = userId;
-  db.users[userId] = tokenUser;
-  db.workspaces[userId] = {
-    history: [],
-    organisations: [],
-    settings: { ...DEFAULT_SETTINGS },
-  };
-  saveDb(db);
-
+  const session = createSessionToken(tokenUser.id, rememberMe);
   return {
     ok: true,
     user: toAuthUser(tokenUser),
-    sessionToken: createSessionToken(userId),
+    sessionToken: session.token,
+    ttlMs: session.ttlMs,
   };
 }
 

@@ -773,13 +773,84 @@ async function runWithConcurrency<T, R>(
   return results;
 }
 
+const SESSION_COOKIE_NAME = 'upsite_session';
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!cookieHeader) return result;
+  for (const part of cookieHeader.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const rawVal = part.slice(eqIdx + 1).trim();
+    if (!key) continue;
+    try {
+      result[key] = decodeURIComponent(rawVal);
+    } catch {
+      result[key] = rawVal;
+    }
+  }
+  return result;
+}
+
+function isHttpsRequest(req: Request): boolean {
+  const forwarded = req.headers['x-forwarded-proto'];
+  const proto = typeof forwarded === 'string' ? forwarded.split(',')[0].trim().toLowerCase() : '';
+  return Boolean(req.secure || proto === 'https');
+}
+
+function setSessionCookie(req: Request, res: Response, token: string, ttlMs: number): void {
+  const maxAgeSec = Math.max(60, Math.floor(ttlMs / 1000));
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+    'HttpOnly',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const parts = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'Max-Age=0', 'HttpOnly'];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  let token = '';
+  let usedCookie = false;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice(7).trim();
+  } else {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies[SESSION_COOKIE_NAME]) {
+      token = cookies[SESSION_COOKIE_NAME];
+      usedCookie = true;
+    }
+  }
+
+  if (!token) {
     res.status(401).json({ error: 'Authentication required.' });
     return;
   }
-  const token = authHeader.slice(7).trim();
+
+  const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase());
+  if (usedCookie && isMutation && req.headers['x-requested-with'] !== 'upsite-app') {
+    res.status(403).json({ error: 'Forbidden request origin.' });
+    return;
+  }
+
   const userId = verifySessionToken(token);
   if (!userId) {
     res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
@@ -814,7 +885,12 @@ export async function createServer() {
 
   // Authentication Routes (Rate-limited)
   app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
-    const body = req.body as { username?: unknown; password?: unknown; accessToken?: unknown };
+    const body = req.body as {
+      username?: unknown;
+      password?: unknown;
+      accessToken?: unknown;
+      rememberMe?: unknown;
+    };
     if (
       typeof body?.username !== 'string' ||
       typeof body?.password !== 'string' ||
@@ -824,15 +900,23 @@ export async function createServer() {
       return;
     }
 
+    const rememberMe = body.rememberMe !== false;
     const result = registerWithToken({
       username: body.username,
       password: body.password,
       accessToken: body.accessToken,
+      rememberMe,
     });
 
     if (!result.ok) {
       res.status(result.status).json({ error: result.error });
       return;
+    }
+
+    if (rememberMe) {
+      setSessionCookie(req, res, result.sessionToken, result.ttlMs);
+    } else {
+      clearSessionCookie(req, res);
     }
 
     const profile = getUserProfileAndWorkspace(result.user.id);
@@ -844,20 +928,28 @@ export async function createServer() {
   });
 
   app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
-    const body = req.body as { username?: unknown; password?: unknown };
+    const body = req.body as { username?: unknown; password?: unknown; rememberMe?: unknown };
     if (typeof body?.username !== 'string' || typeof body?.password !== 'string') {
       res.status(400).json({ error: 'Username and password are required.' });
       return;
     }
 
+    const rememberMe = body.rememberMe !== false;
     const result = loginWithCredentials({
       username: body.username,
       password: body.password,
+      rememberMe,
     });
 
     if (!result.ok) {
       res.status(result.status).json({ error: result.error });
       return;
+    }
+
+    if (rememberMe) {
+      setSessionCookie(req, res, result.sessionToken, result.ttlMs);
+    } else {
+      clearSessionCookie(req, res);
     }
 
     const profile = getUserProfileAndWorkspace(result.user.id);
@@ -869,16 +961,23 @@ export async function createServer() {
   });
 
   app.post('/api/auth/token-login', authRateLimit, (req: Request, res: Response) => {
-    const body = req.body as { accessToken?: unknown };
+    const body = req.body as { accessToken?: unknown; rememberMe?: unknown };
     if (typeof body?.accessToken !== 'string') {
       res.status(400).json({ error: 'Provide a 10-character access token.' });
       return;
     }
 
-    const result = loginWithAccessToken(body.accessToken);
+    const rememberMe = body.rememberMe !== false;
+    const result = loginWithAccessToken(body.accessToken, rememberMe);
     if (!result.ok) {
       res.status(result.status).json({ error: result.error });
       return;
+    }
+
+    if (rememberMe) {
+      setSessionCookie(req, res, result.sessionToken, result.ttlMs);
+    } else {
+      clearSessionCookie(req, res);
     }
 
     const profile = getUserProfileAndWorkspace(result.user.id);
@@ -889,9 +988,15 @@ export async function createServer() {
     });
   });
 
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    clearSessionCookie(req, res);
+    res.json({ ok: true });
+  });
+
   app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const profile = req.userId ? getUserProfileAndWorkspace(req.userId) : null;
     if (!profile) {
+      clearSessionCookie(req, res);
       res.status(404).json({ error: 'User not found.' });
       return;
     }
