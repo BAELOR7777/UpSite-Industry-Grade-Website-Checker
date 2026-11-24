@@ -12,6 +12,7 @@ async function startLocalBackend() {
   const targetPath = fs.existsSync(compiledEntry) ? compiledEntry : sourceEntry;
 
   process.env.NODE_ENV = 'production';
+  process.env.UPSITE_DATA_DIR = path.join(app.getPath('userData'), 'data');
   const mod = await import(pathToFileURL(targetPath).href);
   const expressApp = await mod.createServer();
 

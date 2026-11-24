@@ -8,7 +8,9 @@ import type {
   UserSettings,
 } from '../src/types/upsite.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), '.data');
+const DATA_DIR = process.env.UPSITE_DATA_DIR
+  ? path.resolve(process.env.UPSITE_DATA_DIR)
+  : path.resolve(process.cwd(), '.data');
 const DB_PATH = path.join(DATA_DIR, 'upsite-db.json');
 const TOKENS_EXPORT_PATH = path.join(DATA_DIR, 'tokens.txt');
 

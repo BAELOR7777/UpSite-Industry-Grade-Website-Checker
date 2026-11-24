@@ -1008,7 +1008,9 @@ export async function createServer() {
   });
 
   const isProd = process.env.NODE_ENV === 'production';
-  const distDir = path.resolve(__dirname, 'dist');
+  const distDir = fs.existsSync(path.resolve(__dirname, 'dist'))
+    ? path.resolve(__dirname, 'dist')
+    : path.resolve(__dirname, '..', 'dist');
 
   if (!isProd && fs.existsSync(path.resolve(__dirname, 'index.html'))) {
     const { createServer: createViteServer } = await import('vite');
