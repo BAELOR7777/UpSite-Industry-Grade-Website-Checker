@@ -1,8 +1,11 @@
 import {
+  Check,
   CheckSquare,
-  Download,
+  ClipboardPaste,
+  Copy,
   FileCode2,
   FileSpreadsheet,
+  FileText,
   FileUp,
   FolderInput,
   Globe,
@@ -14,12 +17,14 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent } from 'react';
 import type { Organisation, ProjectRecord } from '../types/upsite';
 import {
+  copySelectedProjectsBundle,
   exportSelectedProjectsCsv,
   exportSelectedProjectsJson,
-  groupUrlsByDomain,
+  exportSelectedProjectsTxt,
+  groupUrlsByDomainWithStats,
   parseProjectsFromFileContent,
 } from '../utils/projectTransfer';
-import type { ImportedProjectDraft } from '../utils/projectTransfer';
+import type { ImportConflictMode, ImportedProjectDraft } from '../utils/projectTransfer';
 
 interface BulkImportModalProps {
   open: boolean;
@@ -31,7 +36,7 @@ interface BulkImportModalProps {
     targetOrgId: string | null;
     newOrgName: string;
     drafts: ImportedProjectDraft[];
-    mergeMatchingNames: boolean;
+    conflictMode: ImportConflictMode;
   }) => void;
 }
 
@@ -55,9 +60,11 @@ export function BulkImportModal({
   const [fileDrafts, setFileDrafts] = useState<ImportedProjectDraft[]>([]);
   const [fileSummary, setFileSummary] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [fileSkippedCount, setFileSkippedCount] = useState(0);
   const [pasteDrafts, setPasteDrafts] = useState<ImportedProjectDraft[]>([]);
+  const [pasteSkippedCount, setPasteSkippedCount] = useState(0);
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
-  const [mergeMatchingNames, setMergeMatchingNames] = useState(true);
+  const [conflictMode, setConflictMode] = useState<ImportConflictMode>('merge');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -80,13 +87,49 @@ export function BulkImportModal({
   const handlePasteChange = (nextText: string) => {
     setPastedUrls(nextText);
     setErrorMessage(null);
-    const grouped = groupUrlsByDomain(nextText, defaultProtocol);
-    setPasteDrafts(grouped);
+    const trimmed = nextText.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsedBundle = parseProjectsFromFileContent(
+          'pasted-bundle.json',
+          trimmed,
+          defaultProtocol,
+        );
+        setPasteDrafts(parsedBundle.projects);
+        setPasteSkippedCount(parsedBundle.skippedCount);
+        const nextSel: Record<string, boolean> = {};
+        for (const d of parsedBundle.projects) {
+          nextSel[d.tempId] = true;
+        }
+        setSelectedIds((prev) => ({ ...prev, ...nextSel }));
+        return;
+      } catch {
+        // Fall back to plain URL grouping if not valid JSON bundle
+      }
+    }
+
+    const { projects, skippedCount } = groupUrlsByDomainWithStats(nextText, defaultProtocol);
+    setPasteDrafts(projects);
+    setPasteSkippedCount(skippedCount);
     const nextSel: Record<string, boolean> = {};
-    for (const d of grouped) {
+    for (const d of projects) {
       nextSel[d.tempId] = true;
     }
     setSelectedIds((prev) => ({ ...prev, ...nextSel }));
+  };
+
+  const handlePasteFromClipboard = async () => {
+    setErrorMessage(null);
+    try {
+      const clipText = await navigator.clipboard.readText();
+      if (!clipText.trim()) {
+        setErrorMessage('Clipboard is empty.');
+        return;
+      }
+      handlePasteChange(clipText);
+    } catch {
+      setErrorMessage('Clipboard read was blocked. Paste directly into the box below.');
+    }
   };
 
   const processSelectedFile = async (file: File) => {
@@ -100,6 +143,7 @@ export function BulkImportModal({
       const parsed = parseProjectsFromFileContent(file.name, content, defaultProtocol);
       setFileDrafts(parsed.projects);
       setFileSummary(parsed.summary);
+      setFileSkippedCount(parsed.skippedCount);
       setFileName(file.name);
       const nextSel: Record<string, boolean> = {};
       for (const d of parsed.projects) {
@@ -109,12 +153,14 @@ export function BulkImportModal({
     } catch (err: unknown) {
       setFileDrafts([]);
       setFileSummary(null);
+      setFileSkippedCount(0);
       setFileName(file.name);
       setErrorMessage(err instanceof Error ? err.message : 'Unable to read project file.');
     }
   };
 
   const activeDrafts = mode === 'file' ? fileDrafts : pasteDrafts;
+  const activeSkippedCount = mode === 'file' ? fileSkippedCount : pasteSkippedCount;
 
   const updateDraftName = (tempId: string, name: string) => {
     if (mode === 'file') {
@@ -171,13 +217,15 @@ export function BulkImportModal({
       targetOrgId: selectedOrgId === '__new__' ? null : selectedOrgId,
       newOrgName: newOrgName.trim(),
       drafts: selectedDrafts,
-      mergeMatchingNames,
+      conflictMode,
     });
     setPastedUrls('');
     setPasteDrafts([]);
+    setPasteSkippedCount(0);
     setFileDrafts([]);
     setFileName(null);
     setFileSummary(null);
+    setFileSkippedCount(0);
     setNewOrgName('');
     onClose();
   };
@@ -200,11 +248,11 @@ export function BulkImportModal({
       aria-labelledby="upsite-bulk-import-title"
       className="fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-[1px] flex items-center justify-center p-4"
     >
-      <div className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-2xl overflow-hidden">
+      <div className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#1B1F28] shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-200 dark:border-white/[0.07] flex items-start justify-between gap-4 shrink-0">
           <div className="flex items-start gap-3 min-w-0">
-            <div className="w-9 h-9 rounded-lg bg-slate-100 dark:bg-white/[0.06] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center text-slate-700 dark:text-slate-200 shrink-0">
+            <div className="w-9 h-9 rounded-lg bg-[#F3F5F8] dark:bg-white/[0.06] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center text-blue-600 dark:text-blue-400 shrink-0">
               <FolderInput className="w-4 h-4" strokeWidth={1.75} />
             </div>
             <div className="min-w-0">
@@ -215,7 +263,7 @@ export function BulkImportModal({
                 Bulk Import Projects & URLs
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Import projects from an exported file (.json, .csv, .txt) or paste URLs to auto-group by domain.
+                Import projects from `.json`, `.csv`, `.tsv`, `.txt`, or HTML bookmark files, or paste URLs / exported bundles.
               </p>
             </div>
           </div>
@@ -232,7 +280,7 @@ export function BulkImportModal({
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
           {/* Mode Switcher */}
-          <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-100 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.07]">
+          <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.07]">
             <button
               type="button"
               onClick={() => {
@@ -241,12 +289,12 @@ export function BulkImportModal({
               }}
               className={`inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
                 mode === 'file'
-                  ? 'bg-white dark:bg-white/[0.1] text-slate-900 dark:text-white'
+                  ? 'bg-blue-600 text-white'
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
               }`}
             >
               <FileUp className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-              <span>Import from File (.json / .csv / .txt)</span>
+              <span>Import from File</span>
             </button>
             <button
               type="button"
@@ -256,16 +304,16 @@ export function BulkImportModal({
               }}
               className={`inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
                 mode === 'paste'
-                  ? 'bg-white dark:bg-white/[0.1] text-slate-900 dark:text-white'
+                  ? 'bg-blue-600 text-white'
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
               }`}
             >
               <Globe className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-              <span>Paste URLs (Auto-Group by Domain)</span>
+              <span>Paste URLs or JSON Bundle</span>
             </button>
           </div>
 
-          {/* Target Organisation Selector (when choosing destination) */}
+          {/* Target Organisation Selector */}
           {!initialTargetOrgId && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
@@ -279,7 +327,7 @@ export function BulkImportModal({
                   id="import-target-org"
                   value={selectedOrgId}
                   onChange={(e) => setSelectedOrgId(e.target.value)}
-                  className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
+                  className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
                 >
                   {organisations.map((org) => (
                     <option key={org.id} value={org.id}>
@@ -304,7 +352,7 @@ export function BulkImportModal({
                     value={newOrgName}
                     onChange={(e) => setNewOrgName(e.target.value)}
                     placeholder="e.g. Imported Clients"
-                    className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
+                    className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
                   />
                 </div>
               )}
@@ -322,14 +370,14 @@ export function BulkImportModal({
               onDrop={handleDrop}
               className={`rounded-xl border border-dashed px-5 py-6 text-center space-y-3 transition-colors ${
                 isDragging
-                  ? 'border-rose-500 bg-rose-50/50 dark:bg-rose-500/10'
-                  : 'border-slate-300 dark:border-white/[0.14] bg-slate-50 dark:bg-[#10121C]'
+                  ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-500/10'
+                  : 'border-slate-300 dark:border-white/[0.14] bg-[#F3F5F8] dark:bg-[#12151C]'
               }`}
             >
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".json,.csv,.txt,application/json,text/csv,text/plain"
+                accept=".json,.csv,.tsv,.txt,.md,.html,.htm,application/json,text/csv,text/plain"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) void processSelectedFile(f);
@@ -345,7 +393,7 @@ export function BulkImportModal({
                   {fileName ? `Selected: ${fileName}` : 'Choose a project file or drop it here'}
                 </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Reads exported upsite `.json` bundles, `.csv` project sheets, or `.txt` URL lists.
+                  Supports upsite `.json` bundles, `.csv` / `.tsv` sheets, `[Project]` `.txt` lists, and exported browser bookmarks (`.html`).
                 </p>
               </div>
               <button
@@ -367,24 +415,40 @@ export function BulkImportModal({
           {/* Mode B: Paste URLs */}
           {mode === 'paste' && (
             <div className="space-y-2">
-              <label
-                htmlFor="bulk-import-paste-urls"
-                className="text-xs font-medium text-slate-700 dark:text-slate-300"
-              >
-                Paste URLs (one per line, comma, or space-separated)
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="bulk-import-paste-urls"
+                  className="text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  Paste URLs or an exported upsite JSON bundle
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void handlePasteFromClipboard()}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition-colors whitespace-nowrap shrink-0"
+                >
+                  <ClipboardPaste className="w-3 h-3 shrink-0" strokeWidth={1.75} />
+                  <span>Paste from Clipboard</span>
+                </button>
+              </div>
               <textarea
                 id="bulk-import-paste-urls"
                 rows={4}
                 value={pastedUrls}
                 onChange={(e) => handlePasteChange(e.target.value)}
                 placeholder={'https://example.com\nhttps://api.example.com\nhttps://shop.brand.co.uk\nhttps://docs.brand.co.uk'}
-                className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500 resize-y"
+                className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500 resize-y"
               />
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                Subdomains sharing the same root domain are automatically grouped into suggested projects below. Edit any project name or uncheck groups you want to skip.
+                Subdomains sharing the same root domain are grouped automatically, and groups over 50 URLs split into numbered parts so no URLs are dropped.
               </p>
             </div>
+          )}
+
+          {activeSkippedCount > 0 && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400 tabular-nums">
+              Ignored {activeSkippedCount} invalid or non-HTTP/HTTPS token{activeSkippedCount === 1 ? '' : 's'}.
+            </p>
           )}
 
           {/* Suggested / Parsed Projects Selection List */}
@@ -400,7 +464,7 @@ export function BulkImportModal({
                   className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white whitespace-nowrap"
                 >
                   {allSelected ? (
-                    <CheckSquare className="w-3.5 h-3.5 text-rose-500" strokeWidth={1.75} />
+                    <CheckSquare className="w-3.5 h-3.5 text-blue-500" strokeWidth={1.75} />
                   ) : (
                     <Square className="w-3.5 h-3.5" strokeWidth={1.75} />
                   )}
@@ -408,7 +472,7 @@ export function BulkImportModal({
                 </button>
               </div>
 
-              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
                 {activeDrafts.map((draft) => {
                   const isChecked = selectedIds[draft.tempId] !== false;
                   const matchesExisting = existingProjectNames.has(
@@ -420,8 +484,8 @@ export function BulkImportModal({
                       key={draft.tempId}
                       className={`rounded-xl border p-3.5 space-y-2 transition-colors ${
                         isChecked
-                          ? 'border-slate-300 dark:border-white/[0.12] bg-white dark:bg-[#141724]'
-                          : 'border-slate-200 dark:border-white/[0.06] bg-slate-50/70 dark:bg-[#10121C]/60 opacity-65'
+                          ? 'border-slate-300 dark:border-white/[0.12] bg-white dark:bg-[#151821]'
+                          : 'border-slate-200 dark:border-white/[0.06] bg-slate-50/70 dark:bg-[#12151C]/60 opacity-65'
                       }`}
                     >
                       <div className="flex items-center gap-3">
@@ -435,14 +499,14 @@ export function BulkImportModal({
                             }))
                           }
                           aria-label={`Select project ${draft.name}`}
-                          className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] accent-rose-600 cursor-pointer shrink-0"
+                          className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] accent-blue-600 cursor-pointer shrink-0"
                         />
                         <input
                           type="text"
                           value={draft.name}
                           onChange={(e) => updateDraftName(draft.tempId, e.target.value)}
                           aria-label="Project name"
-                          className="flex-1 min-w-0 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
+                          className="flex-1 min-w-0 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
                         />
                         <span className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">
                           {draft.urls.length} {draft.urls.length === 1 ? 'URL' : 'URLs'}
@@ -452,9 +516,11 @@ export function BulkImportModal({
                       <div className="pl-7 space-y-1">
                         {matchesExisting && (
                           <p className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                            {mergeMatchingNames
+                            {conflictMode === 'merge'
                               ? 'Matches existing project — new URLs will merge into it.'
-                              : 'Matches existing project name — will be added separately.'}
+                              : conflictMode === 'skip'
+                                ? 'Matches existing project — this project will be skipped.'
+                                : 'Matches existing project name — will be added separately.'}
                           </p>
                         )}
                         <p className="text-[11px] font-mono text-slate-500 dark:text-slate-400 break-all line-clamp-2">
@@ -466,15 +532,33 @@ export function BulkImportModal({
                 })}
               </div>
 
-              <label className="flex items-center gap-2.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none pt-1">
-                <input
-                  type="checkbox"
-                  checked={mergeMatchingNames}
-                  onChange={(e) => setMergeMatchingNames(e.target.checked)}
-                  className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] accent-rose-600 cursor-pointer"
-                />
-                <span>Merge URLs into existing project when project name matches</span>
-              </label>
+              <div className="pt-1 space-y-1.5">
+                <span className="text-xs font-medium text-slate-600 dark:text-slate-400 block">
+                  When a project name already exists:
+                </span>
+                <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.07]">
+                  {(
+                    [
+                      { id: 'merge', label: 'Merge URLs' },
+                      { id: 'skip', label: 'Skip Duplicate' },
+                      { id: 'duplicate', label: 'Add as Copy' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setConflictMode(opt.id)}
+                      className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                        conflictMode === opt.id
+                          ? 'bg-blue-600 text-white'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 
@@ -501,7 +585,7 @@ export function BulkImportModal({
             type="button"
             disabled={selectedDrafts.length === 0}
             onClick={handleSubmit}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
           >
             <FolderInput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
             <span>
@@ -528,6 +612,7 @@ export function ExportProjectsModal({
   onClose,
 }: ExportProjectsModalProps) {
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
+  const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -536,6 +621,7 @@ export function ExportProjectsModal({
       next[p.id] = true;
     }
     setSelectedIds(next);
+    setCopiedNotice(null);
   }, [open, projects]);
 
   useEffect(() => {
@@ -572,7 +658,7 @@ export function ExportProjectsModal({
       aria-labelledby="upsite-export-projects-title"
       className="fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-[1px] flex items-center justify-center p-4"
     >
-      <div className="w-full max-w-lg max-h-[85vh] flex flex-col rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-2xl overflow-hidden">
+      <div className="w-full max-w-xl max-h-[85vh] flex flex-col rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#1B1F28] shadow-2xl overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 dark:border-white/[0.07] flex items-start justify-between gap-4 shrink-0">
           <div className="space-y-1 min-w-0">
             <h3
@@ -582,7 +668,7 @@ export function ExportProjectsModal({
               Export Projects from {orgName}
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Select the projects to export. Anyone with upsite can open the exported file and pick which projects to import.
+              Select the projects to export as `.json`, `.csv`, `.txt`, or copy directly to your clipboard for another upsite user.
             </p>
           </div>
           <button
@@ -606,7 +692,7 @@ export function ExportProjectsModal({
               className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white whitespace-nowrap"
             >
               {allSelected ? (
-                <CheckSquare className="w-3.5 h-3.5 text-rose-500" strokeWidth={1.75} />
+                <CheckSquare className="w-3.5 h-3.5 text-blue-500" strokeWidth={1.75} />
               ) : (
                 <Square className="w-3.5 h-3.5" strokeWidth={1.75} />
               )}
@@ -622,8 +708,8 @@ export function ExportProjectsModal({
                   key={project.id}
                   className={`flex items-start gap-3 rounded-xl border px-3.5 py-2.5 cursor-pointer transition-colors ${
                     checked
-                      ? 'border-slate-300 dark:border-white/[0.12] bg-white dark:bg-[#141724]'
-                      : 'border-slate-200 dark:border-white/[0.06] bg-slate-50/70 dark:bg-[#10121C]/60 opacity-65'
+                      ? 'border-slate-300 dark:border-white/[0.12] bg-white dark:bg-[#151821]'
+                      : 'border-slate-200 dark:border-white/[0.06] bg-slate-50/70 dark:bg-[#12151C]/60 opacity-65'
                   }`}
                 >
                   <input
@@ -632,7 +718,7 @@ export function ExportProjectsModal({
                     onChange={(e) =>
                       setSelectedIds((prev) => ({ ...prev, [project.id]: e.target.checked }))
                     }
-                    className="w-4 h-4 mt-0.5 rounded border-slate-300 dark:border-white/[0.2] accent-rose-600 cursor-pointer shrink-0"
+                    className="w-4 h-4 mt-0.5 rounded border-slate-300 dark:border-white/[0.2] accent-blue-600 cursor-pointer shrink-0"
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
@@ -651,6 +737,13 @@ export function ExportProjectsModal({
               );
             })}
           </div>
+
+          {copiedNotice && (
+            <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+              <Check className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
+              <span>{copiedNotice}</span>
+            </p>
+          )}
         </div>
 
         <div className="px-6 py-4 border-t border-slate-200 dark:border-white/[0.07] flex flex-wrap items-center justify-end gap-2 shrink-0">
@@ -660,6 +753,31 @@ export function ExportProjectsModal({
             className="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-colors whitespace-nowrap shrink-0"
           >
             Cancel
+          </button>
+          <button
+            type="button"
+            disabled={selectedProjects.length === 0}
+            onClick={() => {
+              void copySelectedProjectsBundle(orgName, selectedProjects)
+                .then((msg) => setCopiedNotice(msg))
+                .catch(() => setCopiedNotice('Clipboard copy unavailable.'));
+            }}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.08] hover:bg-slate-200 dark:hover:bg-white/[0.14] transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+          >
+            <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+            <span>Copy JSON</span>
+          </button>
+          <button
+            type="button"
+            disabled={selectedProjects.length === 0}
+            onClick={() => {
+              exportSelectedProjectsTxt(orgName, selectedProjects);
+              onClose();
+            }}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.08] hover:bg-slate-200 dark:hover:bg-white/[0.14] transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+          >
+            <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+            <span>Export TXT</span>
           </button>
           <button
             type="button"
@@ -680,10 +798,10 @@ export function ExportProjectsModal({
               exportSelectedProjectsJson(orgName, selectedProjects);
               onClose();
             }}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
           >
             <FileCode2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-            <span>Export Project File (.json)</span>
+            <span>Export JSON File</span>
           </button>
         </div>
       </div>

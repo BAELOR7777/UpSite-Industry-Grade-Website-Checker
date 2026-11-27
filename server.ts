@@ -12,6 +12,8 @@ import type { NextFunction, Request, Response } from 'express';
 import {
   appendUserHistory,
   clearUserHistory,
+  clearUserIncidents,
+  deduplicateUserHistory,
   ensureInitialized,
   getUserProfileAndWorkspace,
   loginWithAccessToken,
@@ -19,6 +21,7 @@ import {
   registerWithToken,
   sanitizeCheckWindow,
   saveUserCheckerInput,
+  saveUserIncidents,
   saveUserOrganisations,
   SESSION_REMEMBER_TTL_MS,
   updateUserSettings,
@@ -30,8 +33,14 @@ import type {
   CheckOptions,
   DiagnosisInfo,
   DnsCheckResult,
+  IncidentRecord,
+  IntegrationChannel,
+  IntegrationProvider,
+  KeywordCheckResult,
   Organisation,
+  ProjectCheckRules,
   RedirectHop,
+  ReportDispatchPayload,
   SiteCheckResult,
   SiteStatus,
   SslCheckResult,
@@ -42,11 +51,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MAX_BULK_URLS = 60;
-const CONCURRENCY_LIMIT = 8;
+const CONCURRENCY_LIMIT = 6;
 const DEFAULT_TIMEOUT_MS = 8500;
 const MAX_REDIRECTS = 10;
 const AUTH_RATE_WINDOW_MS = 60_000;
 const AUTH_RATE_MAX = 15;
+
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 interface AuthenticatedRequest extends Request {
   userId?: string;
@@ -128,7 +140,7 @@ function isPrivateOrReservedIp(ip: string): boolean {
 function normalizeUrlInput(
   raw: string,
   defaultProtocol: 'https' | 'http' = 'https',
-): { ok: true; url: URL } | { ok: false; reason: string } {
+): { ok: true; url: URL; hasExplicitScheme: boolean } | { ok: false; reason: string } {
   const trimmed = raw.trim();
   if (!trimmed) {
     return { ok: false, reason: 'URL is empty.' };
@@ -137,8 +149,8 @@ function normalizeUrlInput(
     return { ok: false, reason: 'URL exceeds maximum length of 2048 characters.' };
   }
 
-  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
-  const candidate = hasScheme ? trimmed : `${defaultProtocol}://${trimmed}`;
+  const hasExplicitScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  const candidate = hasExplicitScheme ? trimmed : `${defaultProtocol}://${trimmed}`;
 
   try {
     const parsed = new URL(candidate);
@@ -148,13 +160,66 @@ function normalizeUrlInput(
     if (!parsed.hostname || parsed.hostname.length > 253) {
       return { ok: false, reason: 'Invalid hostname.' };
     }
-    return { ok: true, url: parsed };
+    return { ok: true, url: parsed, hasExplicitScheme };
   } catch {
     return { ok: false, reason: 'Invalid URL format.' };
   }
 }
 
-async function resolvePublicHost(hostname: string): Promise<DnsCheckResult & { primaryIp?: string }> {
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function prioritizeAddresses(addresses: string[]): string[] {
+  const unique = Array.from(new Set(addresses));
+  const ipv4 = unique.filter((addr) => net.isIP(addr) === 4);
+  const ipv6 = unique.filter((addr) => net.isIP(addr) === 6);
+  return [...ipv4, ...ipv6];
+}
+
+async function resolveWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' })),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function queryDnsOnce(hostname: string): Promise<string[]> {
+  // Run c-ares resolve4/resolve6 first or alongside system lookup so libuv's 4-thread pool
+  // doesn't bottleneck bulk checks, falling back to dns.lookup for /etc/hosts or OS resolvers.
+  const [v4Result, v6Result] = await Promise.allSettled([
+    resolveWithTimeout(dns.promises.resolve4(hostname), 4500),
+    resolveWithTimeout(dns.promises.resolve6(hostname), 4500),
+  ]);
+
+  const resolvedDirect: string[] = [];
+  if (v4Result.status === 'fulfilled') resolvedDirect.push(...v4Result.value);
+  if (v6Result.status === 'fulfilled') resolvedDirect.push(...v6Result.value);
+
+  if (resolvedDirect.length > 0) {
+    return prioritizeAddresses(resolvedDirect);
+  }
+
+  const lookupRecords = await resolveWithTimeout(
+    dns.promises.lookup(hostname, { all: true, verbatim: true }),
+    5000,
+  );
+  return prioritizeAddresses(lookupRecords.map((r) => r.address));
+}
+
+async function resolvePublicHost(
+  hostname: string,
+): Promise<DnsCheckResult & { primaryIp?: string; candidateIps?: string[] }> {
   const hostLower = hostname.toLowerCase();
   if (hostLower === 'localhost' || hostLower.endsWith('.local') || hostLower.endsWith('.internal')) {
     return {
@@ -179,59 +244,210 @@ async function resolvePublicHost(hostname: string): Promise<DnsCheckResult & { p
       hostname,
       addresses: [hostname],
       primaryIp: hostname,
+      candidateIps: [hostname],
     };
   }
 
+  let lastErrorCode = 'ENOTFOUND';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const addresses = await queryDnsOnce(hostname);
+      if (addresses.length === 0) {
+        lastErrorCode = 'ENOTFOUND';
+      } else if (addresses.some((addr) => isPrivateOrReservedIp(addr))) {
+        return {
+          resolved: false,
+          hostname,
+          addresses: [],
+          error: 'PRIVATE_NETWORK_BLOCKED',
+        };
+      } else {
+        return {
+          resolved: true,
+          hostname,
+          addresses,
+          primaryIp: addresses[0],
+          candidateIps: addresses.slice(0, 4),
+        };
+      }
+    } catch (err: unknown) {
+      lastErrorCode = (err as { code?: string })?.code || 'DNS_ERROR';
+    }
+
+    if (attempt === 0) {
+      await delayMs(180);
+    }
+  }
+
+  return {
+    resolved: false,
+    hostname,
+    addresses: [],
+    error: lastErrorCode,
+  };
+}
+
+function extractSslFromTlsSocket(socket: tls.TLSSocket, hostname: string): SslCheckResult {
   try {
-    const lookupPromise = dns.promises.lookup(hostname, { all: true, verbatim: true });
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' })), 4000);
-    });
+    const cert = socket.getPeerCertificate(false);
+    const protocol = socket.getProtocol() || undefined;
+    const authorized = socket.authorized;
+    const authError = socket.authorizationError ? String(socket.authorizationError) : undefined;
 
-    const records = await Promise.race([lookupPromise, timeoutPromise]);
-    const addresses = Array.from(new Set(records.map((r) => r.address)));
-
-    if (addresses.length === 0) {
+    if (!cert || Object.keys(cert).length === 0) {
       return {
-        resolved: false,
-        hostname,
-        addresses: [],
-        error: 'ENOTFOUND',
+        checked: true,
+        valid: false,
+        protocol,
+        error: authError || 'NO_CERTIFICATE',
       };
     }
 
-    if (addresses.some((addr) => isPrivateOrReservedIp(addr))) {
-      return {
-        resolved: false,
-        hostname,
-        addresses: [],
-        error: 'PRIVATE_NETWORK_BLOCKED',
-      };
-    }
+    const rawIssuer = cert.issuer?.O || cert.issuer?.CN;
+    const issuer = Array.isArray(rawIssuer)
+      ? rawIssuer[0] || 'Unknown Issuer'
+      : rawIssuer || 'Unknown Issuer';
+    const rawSubject = cert.subject?.CN;
+    const subject = Array.isArray(rawSubject)
+      ? rawSubject[0] || hostname
+      : rawSubject || hostname;
+    const validFrom = cert.valid_from;
+    const validTo = cert.valid_to;
+    const expiryMs = validTo ? Date.parse(validTo) : NaN;
+    const daysRemaining = Number.isNaN(expiryMs)
+      ? undefined
+      : Math.floor((expiryMs - Date.now()) / (1000 * 60 * 60 * 24));
 
     return {
-      resolved: true,
-      hostname,
-      addresses,
-      primaryIp: addresses[0],
+      checked: true,
+      valid: authorized && (daysRemaining === undefined || daysRemaining >= 0),
+      protocol,
+      issuer,
+      subject,
+      validFrom,
+      validTo,
+      daysRemaining,
+      error: authorized ? undefined : authError || 'CERT_UNTRUSTED',
     };
   } catch (err: unknown) {
-    const code = (err as { code?: string })?.code || 'DNS_ERROR';
     return {
-      resolved: false,
-      hostname,
-      addresses: [],
-      error: code,
+      checked: true,
+      valid: false,
+      error: (err as Error)?.message || 'TLS_INSPECTION_ERROR',
     };
   }
 }
 
-function pinnedHttpRequest(
-  targetUrl: URL,
-  pinnedIp: string,
-  timeoutMs: number,
-): Promise<{ statusCode: number; statusText: string | null; location?: string }> {
+const MAX_KEYWORD_BODY_BYTES = 262_144;
+const BLOCKED_CUSTOM_HEADERS = new Set([
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'upgrade',
+  'cookie',
+  'te',
+  'trailer',
+  'keep-alive',
+  'proxy-authorization',
+  'proxy-connection',
+]);
+const HEADER_TOKEN_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+function sanitizeCheckRules(raw: unknown): ProjectCheckRules | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Partial<ProjectCheckRules>;
+  const clean: ProjectCheckRules = {};
+  let hasAny = false;
+
+  if (obj.method === 'GET' || obj.method === 'HEAD' || obj.method === 'POST') {
+    clean.method = obj.method;
+    hasAny = true;
+  }
+
+  if (Array.isArray(obj.expectedStatuses)) {
+    const validStatuses = Array.from(
+      new Set(
+        obj.expectedStatuses
+          .map((n) => (typeof n === 'number' ? Math.round(n) : Number(n)))
+          .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599),
+      ),
+    ).slice(0, 15);
+    if (validStatuses.length > 0) {
+      clean.expectedStatuses = validStatuses;
+      hasAny = true;
+    }
+  }
+
+  if (typeof obj.expectedKeyword === 'string') {
+    const trimmed = obj.expectedKeyword.trim().slice(0, 120);
+    if (trimmed) {
+      clean.expectedKeyword = trimmed;
+      hasAny = true;
+    }
+  }
+
+  if (typeof obj.forbiddenKeyword === 'string') {
+    const trimmed = obj.forbiddenKeyword.trim().slice(0, 120);
+    if (trimmed) {
+      clean.forbiddenKeyword = trimmed;
+      hasAny = true;
+    }
+  }
+
+  if (Array.isArray(obj.customHeaders)) {
+    const safeHeaders: Array<{ key: string; value: string }> = [];
+    for (const h of obj.customHeaders) {
+      if (!h || typeof h !== 'object') continue;
+      const key = typeof h.key === 'string' ? h.key.trim().slice(0, 64) : '';
+      const val = typeof h.value === 'string' ? h.value.trim().slice(0, 512) : '';
+      const lower = key.toLowerCase();
+      if (!key || !HEADER_TOKEN_REGEX.test(key)) continue;
+      if (BLOCKED_CUSTOM_HEADERS.has(lower) || lower.startsWith('proxy-')) continue;
+      if (/[\r\n\0]/.test(val)) continue;
+      safeHeaders.push({ key, value: val });
+      if (safeHeaders.length >= 8) break;
+    }
+    if (safeHeaders.length > 0) {
+      clean.customHeaders = safeHeaders;
+      hasAny = true;
+    }
+  }
+
+  return hasAny ? clean : undefined;
+}
+
+interface PinnedHttpResponse {
+  statusCode: number;
+  statusText: string | null;
+  location?: string;
+  setCookies: string[];
+  ssl?: SslCheckResult;
+  bodySnippet?: string;
+}
+
+function pinnedHttpRequest(params: {
+  targetUrl: URL;
+  pinnedIp: string;
+  timeoutMs: number;
+  method?: 'GET' | 'HEAD' | 'POST';
+  cookieHeader?: string;
+  customHeaders?: Array<{ key: string; value: string }>;
+  captureSsl?: boolean;
+  captureBody?: boolean;
+}): Promise<PinnedHttpResponse> {
+  const {
+    targetUrl,
+    pinnedIp,
+    timeoutMs,
+    method = 'GET',
+    cookieHeader,
+    customHeaders,
+    captureSsl = false,
+    captureBody = false,
+  } = params;
   return new Promise((resolve, reject) => {
+    let settled = false;
     const isHttps = targetUrl.protocol === 'https:';
     const ipFamily = net.isIP(pinnedIp) === 6 ? 6 : 4;
     const defaultPort = isHttps ? 443 : 80;
@@ -249,32 +465,101 @@ function pinnedHttpRequest(
       }
     };
 
+    const headers: Record<string, string> = {
+      'User-Agent': BROWSER_USER_AGENT,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    };
+    if (customHeaders) {
+      for (const h of customHeaders) {
+        headers[h.key] = h.value;
+      }
+    }
+    // Always enforce safe Host & Connection headers
+    headers.Host = targetUrl.host;
+    headers.Connection = 'close';
+    if (method === 'POST') {
+      headers['Content-Length'] = '0';
+    }
+    if (cookieHeader) {
+      headers.Cookie = cookieHeader;
+    }
+
     const transport = isHttps ? https : http;
     const req = transport.request(
       {
+        agent: false,
         protocol: targetUrl.protocol,
         hostname: targetUrl.hostname,
         port,
         path: `${targetUrl.pathname}${targetUrl.search}`,
-        method: 'GET',
+        method,
         timeout: timeoutMs,
         lookup: pinnedLookup,
         rejectUnauthorized: false,
         servername: net.isIP(targetUrl.hostname) ? undefined : targetUrl.hostname,
-        headers: {
-          Host: targetUrl.host,
-          'User-Agent': 'upsite-availability-checker/1.0',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          Connection: 'close',
-        },
+        headers,
       },
       (res) => {
+        if (settled) {
+          res.destroy();
+          return;
+        }
+
         const statusCode = res.statusCode ?? 0;
         const statusText = res.statusMessage || null;
         const rawLocation = res.headers.location;
         const location = Array.isArray(rawLocation) ? rawLocation[0] : rawLocation;
-        res.destroy();
-        resolve({ statusCode, statusText, location });
+        const rawSetCookie = res.headers['set-cookie'];
+        const setCookies = Array.isArray(rawSetCookie)
+          ? rawSetCookie
+          : typeof rawSetCookie === 'string'
+            ? [rawSetCookie]
+            : [];
+
+        let ssl: SslCheckResult | undefined;
+        if (captureSsl && isHttps && res.socket instanceof tls.TLSSocket) {
+          ssl = extractSslFromTlsSocket(res.socket, targetUrl.hostname);
+        }
+
+        const isRedirect = statusCode >= 300 && statusCode < 400 && Boolean(location);
+        if (!captureBody || method === 'HEAD' || isRedirect) {
+          settled = true;
+          res.destroy();
+          resolve({ statusCode, statusText, location, setCookies, ssl });
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        const finalizeBody = () => {
+          if (settled) return;
+          settled = true;
+          const bodySnippet = Buffer.concat(chunks).toString('utf8');
+          resolve({ statusCode, statusText, location, setCookies, ssl, bodySnippet });
+        };
+
+        res.on('data', (chunk: Buffer) => {
+          if (settled) return;
+          const remaining = MAX_KEYWORD_BODY_BYTES - totalBytes;
+          if (remaining <= 0) {
+            finalizeBody();
+            res.destroy();
+            return;
+          }
+          const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+          chunks.push(slice);
+          totalBytes += slice.length;
+          if (totalBytes >= MAX_KEYWORD_BODY_BYTES) {
+            finalizeBody();
+            res.destroy();
+          }
+        });
+        res.on('end', finalizeBody);
+        res.on('close', finalizeBody);
+        res.on('error', () => finalizeBody());
       },
     );
 
@@ -283,6 +568,8 @@ function pinnedHttpRequest(
     });
 
     req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
       reject(err);
     });
 
@@ -290,7 +577,12 @@ function pinnedHttpRequest(
   });
 }
 
-async function inspectSslCertificate(hostname: string, port: number, connectIp?: string): Promise<SslCheckResult> {
+async function inspectSslCertificate(
+  hostname: string,
+  port: number,
+  connectIp?: string,
+  timeoutMs = 5500,
+): Promise<SslCheckResult> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: SslCheckResult) => {
@@ -306,61 +598,12 @@ async function inspectSslCertificate(hostname: string, port: number, connectIp?:
         port,
         servername: net.isIP(hostname) ? undefined : hostname,
         rejectUnauthorized: false,
-        timeout: 4500,
+        timeout: Math.max(4500, Math.min(timeoutMs, 10000)),
       },
       () => {
-        try {
-          const cert = socket.getPeerCertificate(false);
-          const protocol = socket.getProtocol() || undefined;
-          const authorized = socket.authorized;
-          const authError = socket.authorizationError ? String(socket.authorizationError) : undefined;
-
-          if (!cert || Object.keys(cert).length === 0) {
-            socket.destroy();
-            finish({
-              checked: true,
-              valid: false,
-              protocol,
-              error: authError || 'NO_CERTIFICATE',
-            });
-            return;
-          }
-
-          const rawIssuer = cert.issuer?.O || cert.issuer?.CN;
-          const issuer = Array.isArray(rawIssuer)
-            ? rawIssuer[0] || 'Unknown Issuer'
-            : rawIssuer || 'Unknown Issuer';
-          const rawSubject = cert.subject?.CN;
-          const subject = Array.isArray(rawSubject)
-            ? rawSubject[0] || hostname
-            : rawSubject || hostname;
-          const validFrom = cert.valid_from;
-          const validTo = cert.valid_to;
-          const expiryMs = validTo ? Date.parse(validTo) : NaN;
-          const daysRemaining = Number.isNaN(expiryMs)
-            ? undefined
-            : Math.floor((expiryMs - Date.now()) / (1000 * 60 * 60 * 24));
-
-          socket.destroy();
-          finish({
-            checked: true,
-            valid: authorized && (daysRemaining === undefined || daysRemaining >= 0),
-            protocol,
-            issuer,
-            subject,
-            validFrom,
-            validTo,
-            daysRemaining,
-            error: authorized ? undefined : authError || 'CERT_UNTRUSTED',
-          });
-        } catch (err: unknown) {
-          socket.destroy();
-          finish({
-            checked: true,
-            valid: false,
-            error: (err as Error)?.message || 'TLS_INSPECTION_ERROR',
-          });
-        }
+        const result = extractSslFromTlsSocket(socket, hostname);
+        socket.destroy();
+        finish(result);
       },
     );
 
@@ -391,8 +634,21 @@ function buildDiagnosis(params: {
   ssl: SslCheckResult;
   networkErrorCode?: string;
   timeoutMs: number;
+  rules?: ProjectCheckRules;
+  keywordCheck?: KeywordCheckResult;
+  sslWarningDays?: number;
 }): DiagnosisInfo {
-  const { status, httpStatusCode, dns: dnsRes, ssl, networkErrorCode, timeoutMs } = params;
+  const {
+    status,
+    httpStatusCode,
+    dns: dnsRes,
+    ssl,
+    networkErrorCode,
+    timeoutMs,
+    rules,
+    keywordCheck,
+    sslWarningDays = 14,
+  } = params;
 
   if (dnsRes.error === 'PRIVATE_NETWORK_BLOCKED') {
     return {
@@ -470,61 +726,94 @@ function buildDiagnosis(params: {
   }
 
   if (httpStatusCode !== null) {
-    if (httpStatusCode === 401 || httpStatusCode === 403) {
+    const hasCustomStatuses = Boolean(rules?.expectedStatuses && rules.expectedStatuses.length > 0);
+    const matchesCustomStatus = hasCustomStatuses
+      ? rules!.expectedStatuses!.includes(httpStatusCode)
+      : false;
+
+    if (hasCustomStatuses && !matchesCustomStatus) {
       return {
         errorCode: `HTTP_${httpStatusCode}`,
-        likelyReason:
-          httpStatusCode === 403
-            ? 'The server or WAF (e.g., Cloudflare) denied the request (403 Forbidden).'
-            : 'The endpoint requires authentication credentials (401 Unauthorized).',
-        possibleFix:
-          httpStatusCode === 403
-            ? 'Check WAF/bot protection rules, IP allowlists, or directory permissions on the origin.'
-            : 'Verify access tokens or public route configuration if the page should be publicly accessible.',
+        likelyReason: `Expected HTTP ${rules!.expectedStatuses!.join(', ')}, but server returned HTTP ${httpStatusCode}.`,
+        possibleFix: 'Verify the endpoint response or update Expected HTTP Statuses in Project Check Rules.',
       };
     }
-    if (httpStatusCode === 404) {
+
+    if (!hasCustomStatuses) {
+      if (httpStatusCode === 401 || httpStatusCode === 403) {
+        return {
+          errorCode: `HTTP_${httpStatusCode}`,
+          likelyReason:
+            httpStatusCode === 403
+              ? 'The server or WAF (e.g., Cloudflare) denied the request (403 Forbidden).'
+              : 'The endpoint requires authentication credentials (401 Unauthorized).',
+          possibleFix:
+            httpStatusCode === 403
+              ? 'Check WAF/bot protection rules, IP allowlists, or directory permissions on the origin.'
+              : 'Verify access tokens or public route configuration if the page should be publicly accessible.',
+        };
+      }
+      if (httpStatusCode === 404) {
+        return {
+          errorCode: 'HTTP_404',
+          likelyReason: 'The server is reachable, but the requested URL path does not exist (404 Not Found).',
+          possibleFix: 'Check the URL path for typos, verify routing rules, or restore the missing resource.',
+        };
+      }
+      if (httpStatusCode === 429) {
+        return {
+          errorCode: 'HTTP_429',
+          likelyReason: 'The server is throttling incoming requests due to rate limits (429 Too Many Requests).',
+          possibleFix: 'Reduce check frequency or allowlist monitoring requests on your API gateway.',
+        };
+      }
+      if (httpStatusCode >= 500) {
+        return {
+          errorCode: `HTTP_${httpStatusCode}`,
+          likelyReason: `The origin or upstream server encountered an internal failure (${httpStatusCode}).`,
+          possibleFix:
+            httpStatusCode === 502 || httpStatusCode === 504
+              ? 'Check if the upstream app process crashed or timed out behind the reverse proxy.'
+              : 'Inspect application error logs, database connectivity, and recent deployments.',
+        };
+      }
+      if (httpStatusCode >= 400) {
+        return {
+          errorCode: `HTTP_${httpStatusCode}`,
+          likelyReason: `The server returned a client error status (${httpStatusCode}).`,
+          possibleFix: 'Review the target URL, HTTP method, and server access policies.',
+        };
+      }
+    }
+  }
+
+  if (keywordCheck?.checked && !keywordCheck.passed) {
+    if (keywordCheck.forbiddenFound) {
       return {
-        errorCode: 'HTTP_404',
-        likelyReason: 'The server is reachable, but the requested URL path does not exist (404 Not Found).',
-        possibleFix: 'Check the URL path for typos, verify routing rules, or restore the missing resource.',
+        errorCode: 'FORBIDDEN_KEYWORD_FOUND',
+        likelyReason: `Page content contained the forbidden keyword "${keywordCheck.forbiddenKeyword}".`,
+        possibleFix: 'Inspect the live site for error notices, maintenance banners, or unexpected content.',
       };
     }
-    if (httpStatusCode === 429) {
-      return {
-        errorCode: 'HTTP_429',
-        likelyReason: 'The server is throttling incoming requests due to rate limits (429 Too Many Requests).',
-        possibleFix: 'Reduce check frequency or allowlist monitoring requests on your API gateway.',
-      };
-    }
-    if (httpStatusCode >= 500) {
-      return {
-        errorCode: `HTTP_${httpStatusCode}`,
-        likelyReason: `The origin or upstream server encountered an internal failure (${httpStatusCode}).`,
-        possibleFix:
-          httpStatusCode === 502 || httpStatusCode === 504
-            ? 'Check if the upstream app process crashed or timed out behind the reverse proxy.'
-            : 'Inspect application error logs, database connectivity, and recent deployments.',
-      };
-    }
-    if (httpStatusCode >= 400) {
-      return {
-        errorCode: `HTTP_${httpStatusCode}`,
-        likelyReason: `The server returned a client error status (${httpStatusCode}).`,
-        possibleFix: 'Review the target URL, HTTP method, and server access policies.',
-      };
-    }
+    return {
+      errorCode: 'KEYWORD_MISSING',
+      likelyReason: `Required keyword "${keywordCheck.expectedKeyword}" was not found in the response body.`,
+      possibleFix: 'Check if the page rendered properly, redirected to a login wall, or update the expected keyword.',
+    };
   }
 
   if (status === 'online') {
     if (!ssl.checked) {
       return {
         errorCode: 'NONE',
-        likelyReason: 'Website responded normally over HTTP or SSL deep inspection was skipped.',
+        likelyReason:
+          rules?.expectedStatuses && httpStatusCode !== null
+            ? `Website responded with expected status HTTP ${httpStatusCode}.`
+            : 'Website responded normally over HTTP or SSL deep inspection was skipped.',
         possibleFix: 'No action required.',
       };
     }
-    if (ssl.daysRemaining !== undefined && ssl.daysRemaining <= 14) {
+    if (ssl.daysRemaining !== undefined && ssl.daysRemaining <= sslWarningDays) {
       return {
         errorCode: 'SSL_EXPIRING_SOON',
         likelyReason: `Website is online, but the SSL certificate expires in ${ssl.daysRemaining} day(s).`,
@@ -545,6 +834,316 @@ function buildDiagnosis(params: {
   };
 }
 
+interface ProbeAttemptResult {
+  finalUrl: URL;
+  finalPrimaryIp: string;
+  httpStatusCode: number | null;
+  httpStatusText: string | null;
+  networkErrorCode?: string;
+  redirects: RedirectHop[];
+  responseTimeMs: number | null;
+  sslResult: SslCheckResult;
+  bodySnippet?: string;
+}
+
+function mergeCookies(jar: Map<string, string>, setCookies: string[]): void {
+  for (const raw of setCookies) {
+    const firstPart = raw.split(';', 1)[0]?.trim();
+    if (!firstPart) continue;
+    const eqIdx = firstPart.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const name = firstPart.slice(0, eqIdx).trim();
+    const val = firstPart.slice(eqIdx + 1).trim();
+    if (name) jar.set(name, val);
+  }
+}
+
+function formatCookieHeader(jar: Map<string, string>): string | undefined {
+  if (jar.size === 0) return undefined;
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ETIMEDOUT',
+  'TIMEOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'EADDRNOTAVAIL',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ECONNABORTED',
+  'FETCH_FAILED',
+]);
+
+const RETRYABLE_HTTP_STATUSES = new Set([403, 405, 406, 408, 425, 429, 500, 502, 503, 504]);
+
+async function executeProbeWithRedirects(params: {
+  initialUrl: URL;
+  initialCandidateIps: string[];
+  timeoutMs: number;
+  deepInspect: boolean;
+  preferredMethod?: 'GET' | 'HEAD' | 'POST';
+  customHeaders?: Array<{ key: string; value: string }>;
+  captureBody?: boolean;
+}): Promise<ProbeAttemptResult> {
+  const {
+    initialUrl,
+    initialCandidateIps,
+    timeoutMs,
+    deepInspect,
+    preferredMethod = 'GET',
+    customHeaders,
+    captureBody = false,
+  } = params;
+
+  const redirects: RedirectHop[] = [];
+  const cookieJar = new Map<string, string>();
+  let currentUrl = initialUrl;
+  let currentIps = initialCandidateIps;
+  let finalPrimaryIp = initialCandidateIps[0];
+  let httpStatusCode: number | null = null;
+  let httpStatusText: string | null = null;
+  let networkErrorCode: string | undefined;
+  let latestSsl: SslCheckResult | undefined;
+  let bodySnippet: string | undefined;
+
+  const startTime = performance.now();
+  const maxTotalBudgetMs = Math.round(timeoutMs * 1.6);
+
+  try {
+    for (let step = 1; step <= MAX_REDIRECTS; step++) {
+      const elapsed = performance.now() - startTime;
+      if (elapsed >= maxTotalBudgetMs) {
+        networkErrorCode = 'ETIMEDOUT';
+        break;
+      }
+
+      const hopTimeout = Math.max(2500, Math.min(timeoutMs, Math.round(maxTotalBudgetMs - elapsed)));
+      const cookieHeader = formatCookieHeader(cookieJar);
+
+      let response: PinnedHttpResponse | undefined;
+      let lastHopError: unknown;
+
+      for (let ipIdx = 0; ipIdx < currentIps.length; ipIdx++) {
+        const candidateIp = currentIps[ipIdx];
+        try {
+          response = await pinnedHttpRequest({
+            targetUrl: currentUrl,
+            pinnedIp: candidateIp,
+            timeoutMs: hopTimeout,
+            method: preferredMethod,
+            cookieHeader,
+            customHeaders,
+            captureSsl: deepInspect && currentUrl.protocol === 'https:',
+            captureBody,
+          });
+          finalPrimaryIp = candidateIp;
+          break;
+        } catch (err: unknown) {
+          lastHopError = err;
+          const code =
+            (err as { cause?: { code?: string }; code?: string })?.cause?.code ||
+            (err as { code?: string })?.code ||
+            'FETCH_FAILED';
+          // Only fail over to another IP if there is another IP and the error is transport/connect related
+          if (!TRANSIENT_NETWORK_CODES.has(code) || ipIdx === currentIps.length - 1) {
+            throw err;
+          }
+        }
+      }
+
+      if (!response) {
+        throw lastHopError || new Error('Request failed');
+      }
+
+      if (response.ssl) {
+        latestSsl = response.ssl;
+      }
+      mergeCookies(cookieJar, response.setCookies);
+
+      const status = response.statusCode;
+      const locationHeader = response.location;
+      const isRedirect = status >= 300 && status < 400 && Boolean(locationHeader);
+
+      redirects.push({
+        step,
+        url: currentUrl.toString(),
+        statusCode: status,
+        location: locationHeader,
+      });
+
+      httpStatusCode = status;
+      httpStatusText = response.statusText;
+
+      if (!isRedirect || !locationHeader) {
+        bodySnippet = response.bodySnippet;
+        break;
+      }
+
+      let nextUrl: URL;
+      try {
+        nextUrl = new URL(locationHeader, currentUrl);
+      } catch {
+        networkErrorCode = 'INVALID_REDIRECT_URL';
+        break;
+      }
+
+      if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+        networkErrorCode = 'UNSUPPORTED_REDIRECT_SCHEME';
+        break;
+      }
+
+      if (nextUrl.hostname !== currentUrl.hostname) {
+        const hopDns = await resolvePublicHost(nextUrl.hostname);
+        if (!hopDns.resolved || !hopDns.primaryIp) {
+          networkErrorCode = hopDns.error || 'REDIRECT_DNS_FAILED';
+          currentUrl = nextUrl;
+          break;
+        }
+        currentIps = hopDns.candidateIps || [hopDns.primaryIp];
+        finalPrimaryIp = hopDns.primaryIp;
+      }
+
+      currentUrl = nextUrl;
+
+      if (step === MAX_REDIRECTS) {
+        networkErrorCode = 'TOO_MANY_REDIRECTS';
+      }
+    }
+  } catch (err: unknown) {
+    const errObj = err as { name?: string; code?: string; cause?: { code?: string } };
+    networkErrorCode = errObj.cause?.code || errObj.code || 'FETCH_FAILED';
+  }
+
+  const responseTimeMs =
+    networkErrorCode && httpStatusCode === null
+      ? null
+      : Math.max(1, Math.round(performance.now() - startTime));
+
+  let sslResult: SslCheckResult = { checked: false, valid: false };
+  if (deepInspect) {
+    if (latestSsl && currentUrl.protocol === 'https:') {
+      sslResult = latestSsl;
+    } else if (currentUrl.protocol === 'https:' && !networkErrorCode) {
+      const port = currentUrl.port ? Number(currentUrl.port) : 443;
+      sslResult = await inspectSslCertificate(currentUrl.hostname, port, finalPrimaryIp, timeoutMs);
+    } else if (
+      initialUrl.protocol === 'https:' &&
+      networkErrorCode &&
+      networkErrorCode !== 'PRIVATE_NETWORK_BLOCKED' &&
+      networkErrorCode !== 'ETIMEDOUT'
+    ) {
+      const port = initialUrl.port ? Number(initialUrl.port) : 443;
+      sslResult = await inspectSslCertificate(
+        initialUrl.hostname,
+        port,
+        initialCandidateIps[0],
+        timeoutMs,
+      );
+    }
+  }
+
+  return {
+    finalUrl: currentUrl,
+    finalPrimaryIp,
+    httpStatusCode,
+    httpStatusText,
+    networkErrorCode,
+    redirects,
+    responseTimeMs,
+    sslResult,
+    bodySnippet,
+  };
+}
+
+function evaluateKeywordCheck(
+  bodySnippet: string | undefined,
+  rules?: ProjectCheckRules,
+): KeywordCheckResult | undefined {
+  if (!rules?.expectedKeyword && !rules?.forbiddenKeyword) return undefined;
+
+  if (rules.method === 'HEAD') {
+    return {
+      checked: false,
+      passed: true,
+      expectedKeyword: rules.expectedKeyword,
+      forbiddenKeyword: rules.forbiddenKeyword,
+      detail: 'HEAD requests do not return a body; use GET to verify keywords.',
+    };
+  }
+
+  if (typeof bodySnippet !== 'string') {
+    return {
+      checked: false,
+      passed: true,
+      expectedKeyword: rules.expectedKeyword,
+      forbiddenKeyword: rules.forbiddenKeyword,
+      detail: 'No response body captured.',
+    };
+  }
+
+  const lower = bodySnippet.toLowerCase();
+  const expectedMatched = rules.expectedKeyword
+    ? lower.includes(rules.expectedKeyword.toLowerCase())
+    : undefined;
+  const forbiddenFound = rules.forbiddenKeyword
+    ? lower.includes(rules.forbiddenKeyword.toLowerCase())
+    : undefined;
+  const passed = expectedMatched !== false && forbiddenFound !== true;
+
+  let detail = 'All keyword rules matched.';
+  if (forbiddenFound) {
+    detail = `Forbidden text "${rules.forbiddenKeyword}" appeared in response.`;
+  } else if (expectedMatched === false) {
+    detail = `Required keyword "${rules.expectedKeyword}" was not found.`;
+  }
+
+  return {
+    checked: true,
+    passed,
+    expectedKeyword: rules.expectedKeyword,
+    expectedMatched,
+    forbiddenKeyword: rules.forbiddenKeyword,
+    forbiddenFound,
+    detail,
+  };
+}
+
+function classifyProbeOutcome(
+  probe: ProbeAttemptResult,
+  rules?: ProjectCheckRules,
+  keywordCheck?: KeywordCheckResult,
+): SiteStatus {
+  if (probe.networkErrorCode) {
+    return probe.networkErrorCode === 'PRIVATE_NETWORK_BLOCKED' ||
+      probe.networkErrorCode === 'TOO_MANY_REDIRECTS'
+      ? 'error'
+      : 'offline';
+  }
+  if (probe.httpStatusCode !== null) {
+    const statusOk =
+      rules?.expectedStatuses && rules.expectedStatuses.length > 0
+        ? rules.expectedStatuses.includes(probe.httpStatusCode)
+        : probe.httpStatusCode >= 200 && probe.httpStatusCode < 400;
+
+    if (!statusOk) {
+      return 'error';
+    }
+    if (probe.sslResult.checked && !probe.sslResult.valid) {
+      return 'error';
+    }
+    if (keywordCheck?.checked && !keywordCheck.passed) {
+      return 'error';
+    }
+    return 'online';
+  }
+  return 'offline';
+}
+
 async function checkSingleWebsite(inputUrl: string, options?: CheckOptions): Promise<SiteCheckResult> {
   const checkedAt = new Date().toISOString();
   const id = crypto.randomUUID();
@@ -552,6 +1151,13 @@ async function checkSingleWebsite(inputUrl: string, options?: CheckOptions): Pro
   const rawTimeout = typeof options?.timeoutMs === 'number' ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
   const timeoutMs = Math.min(20000, Math.max(2000, rawTimeout));
   const deepInspect = options?.deepInspect !== false;
+  const rules = sanitizeCheckRules(options?.rules);
+  const sslWarningDays =
+    typeof options?.sslWarningDays === 'number' && Number.isFinite(options.sslWarningDays)
+      ? Math.min(90, Math.max(1, Math.round(options.sslWarningDays)))
+      : 14;
+  const needBody = Boolean(rules?.expectedKeyword || rules?.forbiddenKeyword);
+  const preferredMethod = rules?.method || 'GET';
 
   const normalized = normalizeUrlInput(inputUrl, defaultProtocol);
 
@@ -586,7 +1192,7 @@ async function checkSingleWebsite(inputUrl: string, options?: CheckOptions): Pro
     };
   }
 
-  const initialUrl = normalized.url;
+  let initialUrl = normalized.url;
   const dnsResult = await resolvePublicHost(initialUrl.hostname);
 
   if (!dnsResult.resolved || !dnsResult.primaryIp) {
@@ -623,104 +1229,93 @@ async function checkSingleWebsite(inputUrl: string, options?: CheckOptions): Pro
     };
   }
 
-  const redirects: RedirectHop[] = [];
-  let currentUrl = initialUrl;
-  let currentPrimaryIp = dnsResult.primaryIp;
-  let httpStatusCode: number | null = null;
-  let httpStatusText: string | null = null;
-  let networkErrorCode: string | undefined;
+  const candidateIps = dnsResult.candidateIps || [dnsResult.primaryIp];
+  let probe = await executeProbeWithRedirects({
+    initialUrl,
+    initialCandidateIps: candidateIps,
+    timeoutMs,
+    deepInspect,
+    preferredMethod,
+    customHeaders: rules?.customHeaders,
+    captureBody: needBody,
+  });
+  let keywordCheck = probe.httpStatusCode !== null ? evaluateKeywordCheck(probe.bodySnippet, rules) : undefined;
+  let status = classifyProbeOutcome(probe, rules, keywordCheck);
 
-  const startTime = performance.now();
+  // Confirmation retry on transient transport errors or suspect HTTP error statuses
+  const shouldConfirmRetry =
+    status !== 'online' &&
+    ((probe.networkErrorCode && TRANSIENT_NETWORK_CODES.has(probe.networkErrorCode)) ||
+      (probe.httpStatusCode !== null && RETRYABLE_HTTP_STATUSES.has(probe.httpStatusCode)));
 
-  try {
-    for (let step = 1; step <= MAX_REDIRECTS; step++) {
-      const elapsed = performance.now() - startTime;
-      const remainingTimeout = Math.max(500, Math.round(timeoutMs - elapsed));
-      if (elapsed >= timeoutMs) {
-        networkErrorCode = 'ETIMEDOUT';
-        break;
-      }
+  if (shouldConfirmRetry) {
+    await delayMs(350);
 
-      const response = await pinnedHttpRequest(currentUrl, currentPrimaryIp, remainingTimeout);
-      const status = response.statusCode;
-      const locationHeader = response.location;
+    const rotatedIps =
+      candidateIps.length > 1 ? [...candidateIps.slice(1), candidateIps[0]] : candidateIps;
+    const retryMethod: 'GET' | 'HEAD' | 'POST' =
+      rules?.method ||
+      (!needBody &&
+      (probe.httpStatusCode === 403 || probe.httpStatusCode === 405 || probe.httpStatusCode === 406)
+        ? 'HEAD'
+        : 'GET');
 
-      const isRedirect = status >= 300 && status < 400 && Boolean(locationHeader);
-      redirects.push({
-        step,
-        url: currentUrl.toString(),
-        statusCode: status,
-        location: locationHeader,
-      });
+    const retryProbe = await executeProbeWithRedirects({
+      initialUrl,
+      initialCandidateIps: rotatedIps,
+      timeoutMs: Math.max(timeoutMs, 10000),
+      deepInspect,
+      preferredMethod: retryMethod,
+      customHeaders: rules?.customHeaders,
+      captureBody: needBody,
+    });
+    const retryKeyword =
+      retryProbe.httpStatusCode !== null
+        ? evaluateKeywordCheck(retryProbe.bodySnippet, rules)
+        : undefined;
+    const retryStatus = classifyProbeOutcome(retryProbe, rules, retryKeyword);
 
-      httpStatusCode = status;
-      httpStatusText = response.statusText;
-
-      if (!isRedirect || !locationHeader) {
-        break;
-      }
-
-      let nextUrl: URL;
-      try {
-        nextUrl = new URL(locationHeader, currentUrl);
-      } catch {
-        networkErrorCode = 'INVALID_REDIRECT_URL';
-        break;
-      }
-
-      if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
-        networkErrorCode = 'UNSUPPORTED_REDIRECT_SCHEME';
-        break;
-      }
-
-      if (nextUrl.hostname !== currentUrl.hostname) {
-        const hopDns = await resolvePublicHost(nextUrl.hostname);
-        if (!hopDns.resolved || !hopDns.primaryIp) {
-          networkErrorCode = hopDns.error || 'REDIRECT_DNS_FAILED';
-          currentUrl = nextUrl;
-          break;
-        }
-        currentPrimaryIp = hopDns.primaryIp;
-      }
-
-      currentUrl = nextUrl;
-
-      if (step === MAX_REDIRECTS) {
-        networkErrorCode = 'TOO_MANY_REDIRECTS';
-      }
-    }
-  } catch (err: unknown) {
-    const errObj = err as { name?: string; code?: string; cause?: { code?: string } };
-    networkErrorCode = errObj.cause?.code || errObj.code || 'FETCH_FAILED';
-  }
-
-  const responseTimeMs =
-    networkErrorCode && httpStatusCode === null
-      ? null
-      : Math.max(1, Math.round(performance.now() - startTime));
-
-  let sslResult: SslCheckResult = { checked: false, valid: false };
-  if (deepInspect) {
-    if (currentUrl.protocol === 'https:' && !networkErrorCode) {
-      const port = currentUrl.port ? Number(currentUrl.port) : 443;
-      sslResult = await inspectSslCertificate(currentUrl.hostname, port, currentPrimaryIp);
-    } else if (initialUrl.protocol === 'https:' && networkErrorCode !== 'PRIVATE_NETWORK_BLOCKED') {
-      const port = initialUrl.port ? Number(initialUrl.port) : 443;
-      sslResult = await inspectSslCertificate(initialUrl.hostname, port, dnsResult.primaryIp);
+    if (retryStatus === 'online' || (status === 'offline' && retryStatus === 'error')) {
+      probe = retryProbe;
+      keywordCheck = retryKeyword;
+      status = retryStatus;
     }
   }
 
-  let status: SiteStatus = 'offline';
-  if (networkErrorCode) {
-    status =
-      networkErrorCode === 'PRIVATE_NETWORK_BLOCKED' || networkErrorCode === 'TOO_MANY_REDIRECTS'
-        ? 'error'
-        : 'offline';
-  } else if (httpStatusCode !== null) {
-    if (httpStatusCode >= 200 && httpStatusCode < 400) {
-      status = sslResult.checked && !sslResult.valid ? 'error' : 'online';
-    } else {
-      status = 'error';
+  // If the user entered a bare domain (no explicit scheme), defaultProtocol guessed https://,
+  // and port 443 is closed/non-TLS (e.g. HTTP-only site), verify http:// before marking offline
+  const isPort443RefusedOrNonTls =
+    probe.networkErrorCode === 'ECONNREFUSED' ||
+    probe.networkErrorCode === 'EPROTO' ||
+    (probe.networkErrorCode?.startsWith('ERR_SSL_') ?? false);
+
+  if (
+    status !== 'online' &&
+    !normalized.hasExplicitScheme &&
+    initialUrl.protocol === 'https:' &&
+    isPort443RefusedOrNonTls
+  ) {
+    const httpFallbackUrl = new URL(initialUrl.toString());
+    httpFallbackUrl.protocol = 'http:';
+    const httpProbe = await executeProbeWithRedirects({
+      initialUrl: httpFallbackUrl,
+      initialCandidateIps: candidateIps,
+      timeoutMs,
+      deepInspect,
+      preferredMethod,
+      customHeaders: rules?.customHeaders,
+      captureBody: needBody,
+    });
+    const httpKeyword =
+      httpProbe.httpStatusCode !== null
+        ? evaluateKeywordCheck(httpProbe.bodySnippet, rules)
+        : undefined;
+    const httpStatus = classifyProbeOutcome(httpProbe, rules, httpKeyword);
+    if (httpStatus === 'online') {
+      initialUrl = httpFallbackUrl;
+      probe = httpProbe;
+      keywordCheck = httpKeyword;
+      status = httpStatus;
     }
   }
 
@@ -730,27 +1325,31 @@ async function checkSingleWebsite(inputUrl: string, options?: CheckOptions): Pro
     id,
     inputUrl,
     normalizedUrl: initialUrl.toString(),
-    finalUrl: currentUrl.toString(),
+    finalUrl: probe.finalUrl.toString(),
     status,
     statusLabel,
-    responseTimeMs,
-    httpStatusCode,
-    httpStatusText,
+    responseTimeMs: probe.responseTimeMs,
+    httpStatusCode: probe.httpStatusCode,
+    httpStatusText: probe.httpStatusText,
     dns: {
       resolved: dnsResult.resolved,
       hostname: dnsResult.hostname,
       addresses: dnsResult.addresses,
       error: dnsResult.error,
     },
-    ssl: sslResult,
-    redirects,
+    ssl: probe.sslResult,
+    ...(keywordCheck ? { keywordCheck } : {}),
+    redirects: probe.redirects,
     diagnosis: buildDiagnosis({
       status,
-      httpStatusCode,
+      httpStatusCode: probe.httpStatusCode,
       dns: dnsResult,
-      ssl: sslResult,
-      networkErrorCode,
+      ssl: probe.sslResult,
+      networkErrorCode: probe.networkErrorCode,
       timeoutMs,
+      rules,
+      keywordCheck,
+      sslWarningDays,
     }),
     checkedAt,
   };
@@ -873,6 +1472,338 @@ function sanitizeAutoRefresh(val: unknown): AutoRefreshInterval {
     }
   }
   return 0;
+}
+
+function sanitizeReportPayload(raw: unknown): ReportDispatchPayload | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Partial<ReportDispatchPayload>;
+  if (!Array.isArray(obj.sites) || obj.sites.length === 0) return null;
+
+  const sites = obj.sites
+    .filter((s) => Boolean(s && typeof s === 'object'))
+    .slice(0, 60)
+    .map((s) => ({
+      projectName: typeof s.projectName === 'string' ? s.projectName.slice(0, 80) : undefined,
+      url: typeof s.url === 'string' ? s.url.slice(0, 500) : 'Unknown URL',
+      status: (s.status === 'online' || s.status === 'offline' || s.status === 'error'
+        ? s.status
+        : 'error') as SiteStatus,
+      statusLabel: (s.statusLabel === 'Online' || s.statusLabel === 'Offline' || s.statusLabel === 'Error'
+        ? s.statusLabel
+        : 'Error') as 'Online' | 'Offline' | 'Error',
+      httpStatusCode: typeof s.httpStatusCode === 'number' ? s.httpStatusCode : null,
+      responseTimeMs: typeof s.responseTimeMs === 'number' ? s.responseTimeMs : null,
+      errorCode: typeof s.errorCode === 'string' ? s.errorCode.slice(0, 60) : 'UNKNOWN',
+      likelyReason: typeof s.likelyReason === 'string' ? s.likelyReason.slice(0, 240) : undefined,
+    }));
+
+  if (sites.length === 0) return null;
+
+  const onlineCount = sites.filter((s) => s.status === 'online').length;
+  const offlineCount = sites.filter((s) => s.status === 'offline').length;
+  const errorCount = sites.filter((s) => s.status === 'error').length;
+  const latencies = sites
+    .map((s) => s.responseTimeMs)
+    .filter((ms): ms is number => typeof ms === 'number');
+  const avgLatencyMs =
+    latencies.length > 0
+      ? Math.round(latencies.reduce((sum, ms) => sum + ms, 0) / latencies.length)
+      : null;
+
+  return {
+    title:
+      typeof obj.title === 'string' && obj.title.trim()
+        ? obj.title.trim().slice(0, 120)
+        : 'upsite Availability Report',
+    source:
+      typeof obj.source === 'string' && obj.source.trim()
+        ? obj.source.trim().slice(0, 100)
+        : 'upsite Monitor',
+    generatedAt:
+      typeof obj.generatedAt === 'string' && obj.generatedAt
+        ? obj.generatedAt
+        : new Date().toISOString(),
+    totalCount: sites.length,
+    onlineCount,
+    offlineCount,
+    errorCount,
+    avgLatencyMs,
+    sites,
+  };
+}
+
+function buildWebhookBody(provider: IntegrationProvider, report: ReportDispatchPayload): string {
+  const issues = report.sites.filter((s) => s.status !== 'online');
+  const previewSites = (issues.length > 0 ? issues : report.sites).slice(0, 15);
+  const summaryLine = `${report.totalCount} checked · ${report.onlineCount} online · ${report.offlineCount} offline · ${report.errorCount} error${
+    report.avgLatencyMs !== null ? ` · Avg ${report.avgLatencyMs} ms` : ''
+  }`;
+
+  const formatSiteLine = (s: ReportDispatchPayload['sites'][number]) => {
+    const prefix = s.projectName ? `[${s.projectName}] ` : '';
+    const httpPart = s.httpStatusCode !== null ? `HTTP ${s.httpStatusCode}` : 'No HTTP';
+    const msPart = s.responseTimeMs !== null ? `${s.responseTimeMs} ms` : '—';
+    const errPart = s.errorCode !== 'NONE' ? ` · ${s.errorCode}` : '';
+    return `${s.status === 'online' ? '✅' : s.status === 'offline' ? '❌' : '⚠️'} ${prefix}${s.url} — ${s.statusLabel} (${httpPart}, ${msPart}${errPart})`;
+  };
+
+  const linesText = previewSites.map(formatSiteLine).join('\n');
+  const remainingNote =
+    (issues.length > 0 ? issues.length : report.sites.length) > previewSites.length
+      ? `\n...and ${(issues.length > 0 ? issues.length : report.sites.length) - previewSites.length} more.`
+      : '';
+
+  if (provider === 'teams') {
+    const facts = previewSites.slice(0, 12).map((s) => ({
+      title: `${s.statusLabel}${s.projectName ? ` · ${s.projectName}` : ''}`,
+      value: `${s.url} (${s.httpStatusCode !== null ? `HTTP ${s.httpStatusCode}` : 'No HTTP'}, ${
+        s.responseTimeMs !== null ? `${s.responseTimeMs} ms` : '—'
+      }${s.errorCode !== 'NONE' ? `, ${s.errorCode}` : ''})`,
+    }));
+
+    return JSON.stringify({
+      type: 'message',
+      attachments: [
+        {
+          contentType: 'application/vnd.microsoft.card.adaptive',
+          contentUrl: null,
+          content: {
+            $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+            type: 'AdaptiveCard',
+            version: '1.4',
+            body: [
+              {
+                type: 'TextBlock',
+                text: report.title,
+                weight: 'Bolder',
+                size: 'Medium',
+                wrap: true,
+              },
+              {
+                type: 'TextBlock',
+                text: `${report.source} · ${summaryLine}`,
+                isSubtle: true,
+                wrap: true,
+                spacing: 'Small',
+              },
+              {
+                type: 'FactSet',
+                facts,
+                spacing: 'Medium',
+              },
+              ...(remainingNote
+                ? [
+                    {
+                      type: 'TextBlock',
+                      text: remainingNote.trim(),
+                      isSubtle: true,
+                      size: 'Small',
+                      wrap: true,
+                    },
+                  ]
+                : []),
+            ],
+          },
+        },
+      ],
+    });
+  }
+
+  if (provider === 'slack') {
+    return JSON.stringify({
+      text: `${report.title}: ${summaryLine}\n${linesText}${remainingNote}`,
+      blocks: [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: report.title.slice(0, 140) },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*${report.source}*\n${summaryLine}`,
+          },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `${linesText}${remainingNote}`.slice(0, 2900),
+          },
+        },
+      ],
+    });
+  }
+
+  if (provider === 'discord') {
+    const color =
+      report.offlineCount > 0 ? 0xe11d48 : report.errorCount > 0 ? 0xd97706 : 0x10b981;
+    return JSON.stringify({
+      content: `${report.title} — ${summaryLine}`,
+      embeds: [
+        {
+          title: report.title.slice(0, 250),
+          description: `${linesText}${remainingNote}`.slice(0, 3800),
+          color,
+          fields: [
+            { name: 'Online', value: String(report.onlineCount), inline: true },
+            { name: 'Offline', value: String(report.offlineCount), inline: true },
+            { name: 'Error', value: String(report.errorCount), inline: true },
+          ],
+          footer: { text: report.source },
+          timestamp: report.generatedAt,
+        },
+      ],
+    });
+  }
+
+  return JSON.stringify({
+    service: 'upsite',
+    title: report.title,
+    source: report.source,
+    text: `${report.title} (${summaryLine})\n${linesText}${remainingNote}`,
+    summary: summaryLine,
+    counts: {
+      total: report.totalCount,
+      online: report.onlineCount,
+      offline: report.offlineCount,
+      error: report.errorCount,
+    },
+    avgLatencyMs: report.avgLatencyMs,
+    generatedAt: report.generatedAt,
+    sites: report.sites,
+  });
+}
+
+function pinnedHttpsJsonPost(
+  targetUrl: URL,
+  pinnedIp: string,
+  jsonBody: string,
+  timeoutMs = 9000,
+): Promise<{ statusCode: number; responseBody: string }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ipFamily = net.isIP(pinnedIp) === 6 ? 6 : 4;
+    const port = targetUrl.port ? Number(targetUrl.port) : 443;
+
+    const pinnedLookup: Parameters<typeof https.request>[1]['lookup'] = (
+      _hostname,
+      options,
+      callback,
+    ) => {
+      if (typeof options === 'object' && options?.all) {
+        callback(null, [{ address: pinnedIp, family: ipFamily }]);
+      } else {
+        callback(null, pinnedIp, ipFamily);
+      }
+    };
+
+    const req = https.request(
+      {
+        agent: false,
+        protocol: 'https:',
+        hostname: targetUrl.hostname,
+        port,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: 'POST',
+        timeout: timeoutMs,
+        lookup: pinnedLookup,
+        rejectUnauthorized: true,
+        servername: net.isIP(targetUrl.hostname) ? undefined : targetUrl.hostname,
+        headers: {
+          Host: targetUrl.host,
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': Buffer.byteLength(jsonBody, 'utf8'),
+          'User-Agent': 'upsite-report-webhook/1.0',
+          Connection: 'close',
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => {
+          if (chunks.reduce((sum, b) => sum + b.length, 0) < 4096) {
+            chunks.push(chunk);
+          }
+        });
+        res.on('end', () => {
+          if (settled) return;
+          settled = true;
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            responseBody: Buffer.concat(chunks).toString('utf8').slice(0, 300),
+          });
+        });
+      },
+    );
+
+    req.on('timeout', () => {
+      req.destroy(Object.assign(new Error('Webhook request timed out'), { code: 'ETIMEDOUT' }));
+    });
+
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+
+    req.write(jsonBody);
+    req.end();
+  });
+}
+
+async function sendWebhookReport(
+  channel: IntegrationChannel,
+  report: ReportDispatchPayload,
+): Promise<{ ok: boolean; statusCode?: number; message: string }> {
+  let parsed: URL;
+  try {
+    parsed = new URL(channel.webhookUrl.trim());
+  } catch {
+    return { ok: false, statusCode: 400, message: `Invalid webhook URL for ${channel.name}.` };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return {
+      ok: false,
+      statusCode: 400,
+      message: `${channel.name}: Webhook URL must use https://.`,
+    };
+  }
+
+  const dnsResult = await resolvePublicHost(parsed.hostname);
+  if (!dnsResult.resolved || !dnsResult.primaryIp) {
+    return {
+      ok: false,
+      statusCode: 400,
+      message:
+        dnsResult.error === 'PRIVATE_NETWORK_BLOCKED'
+          ? `${channel.name}: Localhost and private network webhook addresses are not permitted.`
+          : `${channel.name}: Could not resolve webhook host (${dnsResult.error || 'DNS_ERROR'}).`,
+    };
+  }
+
+  const payloadBody = buildWebhookBody(channel.provider, report);
+  try {
+    const res = await pinnedHttpsJsonPost(parsed, dnsResult.primaryIp, payloadBody);
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return { ok: true, statusCode: res.statusCode, message: `Sent to ${channel.name}.` };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      message: `${channel.name} returned HTTP ${res.statusCode}${
+        res.responseBody ? `: ${res.responseBody}` : ''
+      }`,
+    };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      statusCode: 502,
+      message: `${channel.name} delivery failed: ${
+        err instanceof Error ? err.message : 'Network error'
+      }`,
+    };
+  }
 }
 
 export async function createServer() {
@@ -1066,6 +1997,11 @@ export async function createServer() {
     res.json({ ok: true });
   });
 
+  app.post('/api/history/deduplicate', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const history = req.userId ? deduplicateUserHistory(req.userId) : [];
+    res.json({ history });
+  });
+
   app.put('/api/organisations', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const body = req.body as { organisations?: unknown };
     if (!Array.isArray(body?.organisations)) {
@@ -1081,6 +2017,14 @@ export async function createServer() {
         name: typeof org.name === 'string' ? org.name.trim().slice(0, 80) : 'Untitled Organisation',
         autoRefreshSec: sanitizeAutoRefresh(org.autoRefreshSec),
         checkWindow: sanitizeCheckWindow(org.checkWindow),
+        maintenanceUntil:
+          typeof org.maintenanceUntil === 'string' && org.maintenanceUntil
+            ? org.maintenanceUntil.slice(0, 64)
+            : undefined,
+        maintenanceReason:
+          typeof org.maintenanceReason === 'string' && org.maintenanceReason.trim()
+            ? org.maintenanceReason.trim().slice(0, 120)
+            : undefined,
         createdAt: typeof org.createdAt === 'string' ? org.createdAt : new Date().toISOString(),
         projects: Array.isArray(org.projects)
           ? sortProjectsByName(
@@ -1097,6 +2041,7 @@ export async function createServer() {
                         .filter(Boolean)
                         .slice(0, 50)
                     : [],
+                  checkRules: sanitizeCheckRules(p.checkRules),
                   lastResults: Array.isArray(p.lastResults) ? p.lastResults.slice(0, 50) : undefined,
                   lastCheckedAt: typeof p.lastCheckedAt === 'string' ? p.lastCheckedAt : undefined,
                   createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
@@ -1111,6 +2056,27 @@ export async function createServer() {
     }
     const saved = saveUserOrganisations(req.userId, sanitized);
     res.json({ organisations: saved });
+  });
+
+  app.put('/api/incidents', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const body = req.body as { incidents?: unknown };
+    if (!Array.isArray(body?.incidents)) {
+      res.status(400).json({ error: 'Invalid incidents payload.' });
+      return;
+    }
+    if (!req.userId) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    const saved = saveUserIncidents(req.userId, body.incidents as IncidentRecord[]);
+    res.json({ incidents: saved });
+  });
+
+  app.delete('/api/incidents', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    if (req.userId) {
+      clearUserIncidents(req.userId);
+    }
+    res.json({ ok: true });
   });
 
   app.put('/api/settings', requireAuth, (req: AuthenticatedRequest, res: Response) => {
@@ -1139,6 +2105,124 @@ export async function createServer() {
     }
     const checkerInput = saveUserCheckerInput(req.userId, body.checkerInput);
     res.json({ checkerInput });
+  });
+
+  // Protected App Integrations Routes (Microsoft Teams, Slack, Discord, Custom Webhooks)
+  app.post('/api/integrations/test', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const body = req.body as { provider?: unknown; webhookUrl?: unknown; name?: unknown };
+    if (typeof body?.webhookUrl !== 'string' || !body.webhookUrl.trim()) {
+      res.status(400).json({ error: 'Provide an HTTPS webhook URL to test.' });
+      return;
+    }
+    const provider: IntegrationProvider =
+      body.provider === 'teams' ||
+      body.provider === 'slack' ||
+      body.provider === 'discord' ||
+      body.provider === 'webhook'
+        ? body.provider
+        : 'webhook';
+    const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 60) : provider;
+
+    const sampleReport: ReportDispatchPayload = {
+      title: 'upsite Connection Test',
+      source: 'Settings Integration Test',
+      generatedAt: new Date().toISOString(),
+      totalCount: 2,
+      onlineCount: 2,
+      offlineCount: 0,
+      errorCount: 0,
+      avgLatencyMs: 124,
+      sites: [
+        {
+          url: 'https://example.com/',
+          status: 'online',
+          statusLabel: 'Online',
+          httpStatusCode: 200,
+          responseTimeMs: 112,
+          errorCode: 'NONE',
+        },
+        {
+          url: 'https://api.example.com/',
+          status: 'online',
+          statusLabel: 'Online',
+          httpStatusCode: 200,
+          responseTimeMs: 136,
+          errorCode: 'NONE',
+        },
+      ],
+    };
+
+    const result = await sendWebhookReport(
+      {
+        id: 'test',
+        name,
+        provider,
+        webhookUrl: body.webhookUrl.trim(),
+        enabled: true,
+        autoSendOnOrgRun: false,
+        onlyOnIssues: false,
+      },
+      sampleReport,
+    );
+
+    if (!result.ok) {
+      res.status(result.statusCode || 400).json({ error: result.message });
+      return;
+    }
+    res.json({ ok: true, message: result.message });
+  });
+
+  app.post('/api/integrations/send', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    if (!req.userId) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    const body = req.body as { channelIds?: unknown; report?: unknown };
+    const report = sanitizeReportPayload(body?.report);
+    if (!report) {
+      res.status(400).json({ error: 'Invalid report payload.' });
+      return;
+    }
+
+    const profile = getUserProfileAndWorkspace(req.userId);
+    const savedChannels = profile?.workspace.settings.integrations || [];
+    const requestedIds = Array.isArray(body?.channelIds)
+      ? new Set(body.channelIds.filter((id): id is string => typeof id === 'string'))
+      : null;
+
+    const targets = savedChannels.filter((ch) => {
+      if (!ch.enabled) return false;
+      if (requestedIds && requestedIds.size > 0) {
+        return requestedIds.has(ch.id);
+      }
+      return true;
+    });
+
+    if (targets.length === 0) {
+      res.status(400).json({ error: 'No enabled app integrations matched this request.' });
+      return;
+    }
+
+    const results = await Promise.all(
+      targets.map(async (channel) => {
+        const resItem = await sendWebhookReport(channel, report);
+        return {
+          id: channel.id,
+          name: channel.name,
+          provider: channel.provider,
+          ok: resItem.ok,
+          error: resItem.ok ? undefined : resItem.message,
+        };
+      }),
+    );
+
+    const sentCount = results.filter((o) => o.ok).length;
+    res.json({
+      ok: sentCount > 0,
+      sentCount,
+      totalTargets: results.length,
+      results,
+    });
   });
 
   const isProd = process.env.NODE_ENV === 'production';

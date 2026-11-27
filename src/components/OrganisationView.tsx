@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowLeft,
+  BellOff,
   Building2,
   CheckCircle2,
   ChevronDown,
@@ -16,7 +17,9 @@ import {
   Pencil,
   Play,
   Plus,
+  Send,
   Share2,
+  SlidersHorizontal,
   Trash2,
   X,
   XCircle,
@@ -26,8 +29,11 @@ import type { FormEvent } from 'react';
 import type {
   AutoRefreshInterval,
   CheckTimeWindow,
+  IntegrationChannel,
   Organisation,
+  ProjectCheckRules,
   ProjectRecord,
+  ReportDispatchPayload,
   SiteCheckResult,
   SiteStatus,
   UserSettings,
@@ -36,12 +42,15 @@ import { CheckWindowPicker } from './CheckWindowPicker';
 import { parseUrlsFromInput } from './CheckerView';
 import { ConfirmModal } from './ConfirmModal';
 import {
+  buildReportDispatchPayloadFromOrgRows,
+  buildReportDispatchPayloadFromResults,
   copyResultsReport,
   copySimpleOrgReport,
   exportResultsToCsv,
   exportResultsToPdf,
   exportSimpleOrgReportCsv,
   exportSimpleOrgReportPdf,
+  exportStatusPageHtml,
   shareResultsPdf,
   shareSimpleOrgReportPdf,
 } from '../utils/exporters';
@@ -56,8 +65,9 @@ import {
 } from '../utils/intervals';
 import { sortProjectsByName } from '../utils/organisations';
 import { mergeImportedProjects } from '../utils/projectTransfer';
-import type { ImportedProjectDraft } from '../utils/projectTransfer';
+import type { ImportConflictMode, ImportedProjectDraft } from '../utils/projectTransfer';
 import { BulkImportModal, ExportProjectsModal } from './ProjectTransferModals';
+import { ReportActionBar, SendReportModal } from './ReportActionBar';
 
 export interface PendingOrgReport {
   orgName: string;
@@ -76,6 +86,7 @@ interface OrganisationViewProps {
   orgNextRunAt: Record<string, number>;
   runningOrgScope: Record<string, string>;
   pendingReport: PendingOrgReport | null;
+  integrations?: IntegrationChannel[];
   onChangeOpenedOrgId: (orgId: string | null) => void;
   onChangeStatusFilter: (filter: 'all' | 'issues' | SiteStatus) => void;
   onSaveOrganisations: (orgs: Organisation[]) => void;
@@ -83,6 +94,14 @@ interface OrganisationViewProps {
   onRunOrgProject: (orgId: string, projectId: string) => Promise<void>;
   onSelectResult: (result: SiteCheckResult) => void;
   onDismissPendingReport: () => void;
+  onSendToApps?: (
+    report: ReportDispatchPayload,
+    channelIds: string[],
+  ) => Promise<{
+    sentCount: number;
+    results: Array<{ id: string; name: string; ok: boolean; error?: string }>;
+  }>;
+  onOpenIntegrationsSettings?: () => void;
 }
 
 export function formatCountdown(totalSeconds: number): string {
@@ -121,6 +140,44 @@ function formatLastCheckedAt(iso?: string): string | null {
   return `${datePart}, ${timePart}`;
 }
 
+function isMaintenanceActive(untilIso?: string, nowMs = Date.now()): boolean {
+  if (!untilIso) return false;
+  const ts = Date.parse(untilIso);
+  return Number.isFinite(ts) && ts > nowMs;
+}
+
+function formatMaintenanceRemaining(untilIso?: string, nowMs = Date.now()): string {
+  if (!untilIso) return '';
+  const diffMs = Math.max(0, Date.parse(untilIso) - nowMs);
+  const mins = Math.ceil(diffMs / 60000);
+  if (mins < 60) return `${mins}m left`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hrs}h ${remMins}m left` : `${hrs}h left`;
+}
+
+function formatRulesSummary(
+  rules: ProjectCheckRules | undefined,
+  showCustomRules: boolean,
+  showKeywords: boolean,
+): string | null {
+  if (!rules) return null;
+  const parts: string[] = [];
+  if (showCustomRules) {
+    if (rules.method && rules.method !== 'GET') parts.push(rules.method);
+    if (rules.expectedStatuses && rules.expectedStatuses.length > 0) {
+      parts.push(`HTTP ${rules.expectedStatuses.join('/')}`);
+    }
+    if (rules.customHeaders && rules.customHeaders.length > 0) {
+      parts.push(`${rules.customHeaders.length} hdr`);
+    }
+  }
+  if (showKeywords && (rules.expectedKeyword || rules.forbiddenKeyword)) {
+    parts.push('Keyword');
+  }
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
 export function OrganisationView({
   organisations,
   settings,
@@ -130,6 +187,7 @@ export function OrganisationView({
   orgNextRunAt,
   runningOrgScope,
   pendingReport,
+  integrations = [],
   onChangeOpenedOrgId,
   onChangeStatusFilter,
   onSaveOrganisations,
@@ -137,12 +195,22 @@ export function OrganisationView({
   onRunOrgProject,
   onSelectResult,
   onDismissPendingReport,
+  onSendToApps,
+  onOpenIntegrationsSettings,
 }: OrganisationViewProps) {
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<Record<string, boolean>>({});
   const [newOrgName, setNewOrgName] = useState('');
   const [projectName, setProjectName] = useState('');
   const [projectUrlsInput, setProjectUrlsInput] = useState('');
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [advancedRulesOpen, setAdvancedRulesOpen] = useState(false);
+  const [ruleMethod, setRuleMethod] = useState<'GET' | 'HEAD' | 'POST'>('GET');
+  const [ruleExpectedStatuses, setRuleExpectedStatuses] = useState('');
+  const [ruleExpectedKeyword, setRuleExpectedKeyword] = useState('');
+  const [ruleForbiddenKeyword, setRuleForbiddenKeyword] = useState('');
+  const [ruleHeadersInput, setRuleHeadersInput] = useState('');
+  const [maintenancePanelOpen, setMaintenancePanelOpen] = useState(false);
+  const [maintenanceReasonInput, setMaintenanceReasonInput] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [customPeriodVal, setCustomPeriodVal] = useState('');
   const [customPeriodUnit, setCustomPeriodUnit] = useState<'min' | 'hr'>('min');
@@ -152,11 +220,31 @@ export function OrganisationView({
   const [modalShareNotice, setModalShareNotice] = useState<string | null>(null);
   const [bulkImportOpen, setBulkImportOpen] = useState(false);
   const [exportProjectsOpen, setExportProjectsOpen] = useState(false);
+  const [sendPendingOpen, setSendPendingOpen] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<
     | { kind: 'delete-project'; project: ProjectRecord }
     | { kind: 'delete-org'; org: Organisation }
     | null
   >(null);
+
+  const showAnalytics = settings.features?.analyticsEnabled !== false;
+  const showMaintenance = settings.features?.maintenanceWindowsEnabled !== false;
+  const showCustomRules = settings.features?.customCheckRulesEnabled !== false;
+  const showKeywordChecks = settings.features?.keywordChecksEnabled !== false;
+  const showAdvancedRulesSection = showCustomRules || showKeywordChecks;
+
+  const resetProjectForm = () => {
+    setEditingProjectId(null);
+    setProjectName('');
+    setProjectUrlsInput('');
+    setAdvancedRulesOpen(false);
+    setRuleMethod('GET');
+    setRuleExpectedStatuses('');
+    setRuleExpectedKeyword('');
+    setRuleForbiddenKeyword('');
+    setRuleHeadersInput('');
+    setErrorMessage(null);
+  };
 
   const showShareNotice = (msg: string) => {
     setShareNotice(msg);
@@ -261,6 +349,27 @@ export function OrganisationView({
     setCustomPeriodVal('');
   };
 
+  const handleSetOrgMaintenance = (minutes: number | null, reason?: string) => {
+    if (!activeOrg) return;
+    const nextUntil =
+      minutes && minutes > 0 ? new Date(Date.now() + minutes * 60_000).toISOString() : undefined;
+    const cleanReason = minutes && minutes > 0 ? (reason ?? maintenanceReasonInput).trim().slice(0, 120) : undefined;
+    const nextOrgs = organisations.map((o) =>
+      o.id === activeOrg.id
+        ? {
+            ...o,
+            maintenanceUntil: nextUntil,
+            maintenanceReason: cleanReason || undefined,
+          }
+        : o,
+    );
+    onSaveOrganisations(nextOrgs);
+    if (!nextUntil) {
+      setMaintenanceReasonInput('');
+    }
+    setMaintenancePanelOpen(false);
+  };
+
   const handleSaveProject = (e: FormEvent) => {
     e.preventDefault();
     if (!activeOrg) return;
@@ -270,18 +379,93 @@ export function OrganisationView({
       setErrorMessage('Provide a project name and at least one URL.');
       return;
     }
+
+    const existingProject = editingProjectId
+      ? activeOrg.projects.find((p) => p.id === editingProjectId)
+      : undefined;
+
+    const nextRules: ProjectCheckRules = { ...(existingProject?.checkRules || {}) };
+
+    if (showCustomRules) {
+      nextRules.method = ruleMethod;
+      const statusTokens = ruleExpectedStatuses
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsedStatuses: number[] = [];
+      for (const tok of statusTokens) {
+        const code = Number(tok);
+        if (!Number.isInteger(code) || code < 100 || code > 599) {
+          setErrorMessage('Expected HTTP status codes must be integers between 100 and 599 (e.g. 200, 204).');
+          return;
+        }
+        if (!parsedStatuses.includes(code)) parsedStatuses.push(code);
+      }
+      if (parsedStatuses.length > 0) {
+        nextRules.expectedStatuses = parsedStatuses;
+      } else {
+        delete nextRules.expectedStatuses;
+      }
+
+      const parsedHeaders: Array<{ key: string; value: string }> = [];
+      const headerLines = ruleHeadersInput
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+      for (const line of headerLines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx <= 0) {
+          setErrorMessage('Custom headers must use "Header-Name: value" format (one per line).');
+          return;
+        }
+        const key = line.slice(0, colonIdx).trim();
+        const value = line.slice(colonIdx + 1).trim();
+        if (!key || !value) {
+          setErrorMessage('Custom headers require both a header name and a value.');
+          return;
+        }
+        parsedHeaders.push({ key, value });
+      }
+      if (parsedHeaders.length > 0) {
+        nextRules.customHeaders = parsedHeaders.slice(0, 10);
+      } else {
+        delete nextRules.customHeaders;
+      }
+    }
+
+    if (showKeywordChecks) {
+      const expKw = ruleExpectedKeyword.trim();
+      const forbKw = ruleForbiddenKeyword.trim();
+      if (expKw) nextRules.expectedKeyword = expKw;
+      else delete nextRules.expectedKeyword;
+      if (forbKw) nextRules.forbiddenKeyword = forbKw;
+      else delete nextRules.forbiddenKeyword;
+    }
+
+    const hasAnyRule =
+      (nextRules.method && nextRules.method !== 'GET') ||
+      (nextRules.expectedStatuses && nextRules.expectedStatuses.length > 0) ||
+      Boolean(nextRules.expectedKeyword) ||
+      Boolean(nextRules.forbiddenKeyword) ||
+      (nextRules.customHeaders && nextRules.customHeaders.length > 0);
+
+    const finalRules = hasAnyRule ? nextRules : undefined;
+
     setErrorMessage(null);
 
     const updatedProjects: ProjectRecord[] = sortProjectsByName(
       editingProjectId
         ? activeOrg.projects.map((p) =>
-            p.id === editingProjectId ? { ...p, name: trimmedName, urls: parsedUrls } : p,
+            p.id === editingProjectId
+              ? { ...p, name: trimmedName, urls: parsedUrls, checkRules: finalRules }
+              : p,
           )
         : [
             {
               id: crypto.randomUUID(),
               name: trimmedName,
               urls: parsedUrls,
+              checkRules: finalRules,
               createdAt: new Date().toISOString(),
             },
             ...activeOrg.projects,
@@ -292,15 +476,28 @@ export function OrganisationView({
       o.id === activeOrg.id ? { ...o, projects: updatedProjects } : o,
     );
     onSaveOrganisations(nextOrgs);
-    setProjectName('');
-    setProjectUrlsInput('');
-    setEditingProjectId(null);
+    resetProjectForm();
   };
 
   const handleEditProject = (project: ProjectRecord) => {
     setEditingProjectId(project.id);
     setProjectName(project.name);
     setProjectUrlsInput(project.urls.join('\n'));
+    const rules = project.checkRules;
+    setRuleMethod(rules?.method || 'GET');
+    setRuleExpectedStatuses(
+      rules?.expectedStatuses && rules.expectedStatuses.length > 0
+        ? rules.expectedStatuses.join(', ')
+        : '',
+    );
+    setRuleExpectedKeyword(rules?.expectedKeyword || '');
+    setRuleForbiddenKeyword(rules?.forbiddenKeyword || '');
+    setRuleHeadersInput(
+      rules?.customHeaders && rules.customHeaders.length > 0
+        ? rules.customHeaders.map((h) => `${h.key}: ${h.value}`).join('\n')
+        : '',
+    );
+    setAdvancedRulesOpen(Boolean(rules));
     setErrorMessage(null);
   };
 
@@ -313,9 +510,7 @@ export function OrganisationView({
     );
     onSaveOrganisations(nextOrgs);
     if (editingProjectId === projectId) {
-      setEditingProjectId(null);
-      setProjectName('');
-      setProjectUrlsInput('');
+      resetProjectForm();
     }
   };
 
@@ -345,15 +540,26 @@ export function OrganisationView({
   const activeTargetMs = activeOrg ? orgNextRunAt[activeOrg.id] : undefined;
 
   useEffect(() => {
-    if (!activeOrg || activeIntervalSec <= 0 || allOrgUrls.length === 0 || !activeTargetMs) {
-      return;
-    }
+    const hasOrgMaint = organisations.some((o) => isMaintenanceActive(o.maintenanceUntil));
+    const hasGlobalMaint = isMaintenanceActive(settings.workspaceMaintenanceUntil);
+    const needsTimer =
+      Boolean(activeOrg && activeIntervalSec > 0 && allOrgUrls.length > 0 && activeTargetMs) ||
+      hasOrgMaint ||
+      hasGlobalMaint;
+    if (!needsTimer) return;
     setNowMs(Date.now());
     const timer = window.setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [activeOrg?.id, activeIntervalSec, allOrgUrls.length, activeTargetMs]);
+  }, [
+    activeOrg?.id,
+    activeIntervalSec,
+    allOrgUrls.length,
+    activeTargetMs,
+    organisations,
+    settings.workspaceMaintenanceUntil,
+  ]);
 
   const countdownSec =
     activeOrg && activeIntervalSec > 0 && allOrgUrls.length > 0 && activeTargetMs
@@ -373,11 +579,24 @@ export function OrganisationView({
 
   const isCompact = settings.density === 'compact';
 
+  const allWorkspaceProjects = useMemo(() => {
+    const combined: ProjectRecord[] = [];
+    for (const org of organisations) {
+      for (const proj of sortProjectsByName(org.projects)) {
+        combined.push({
+          ...proj,
+          name: organisations.length > 1 ? `${org.name} — ${proj.name}` : proj.name,
+        });
+      }
+    }
+    return combined;
+  }, [organisations]);
+
   const handleBulkImportProjects = (payload: {
     targetOrgId: string | null;
     newOrgName: string;
     drafts: ImportedProjectDraft[];
-    mergeMatchingNames: boolean;
+    conflictMode: ImportConflictMode;
   }) => {
     if (payload.drafts.length === 0) return;
 
@@ -389,7 +608,7 @@ export function OrganisationView({
               projects: mergeImportedProjects(
                 org.projects,
                 payload.drafts,
-                payload.mergeMatchingNames,
+                payload.conflictMode,
               ),
             }
           : org,
@@ -410,7 +629,7 @@ export function OrganisationView({
     const createdOrg: Organisation = {
       id: newOrgId,
       name: payload.newOrgName.trim() || 'Imported Organisation',
-      projects: mergeImportedProjects([], payload.drafts, payload.mergeMatchingNames),
+      projects: mergeImportedProjects([], payload.drafts, payload.conflictMode),
       autoRefreshSec: 0,
       checkWindow: { ...DEFAULT_CHECK_WINDOW },
       createdAt: new Date().toISOString(),
@@ -423,8 +642,8 @@ export function OrganisationView({
   if (!activeOrg) {
     return (
       <>
-        <div className="flex-1 flex flex-col min-w-0 h-full overflow-y-auto p-6 lg:p-8 space-y-6">
-          <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] p-5 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 sm:p-6 lg:p-7 space-y-5">
+          <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
             <div className="space-y-0.5">
               <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                 Company Organisations
@@ -438,24 +657,35 @@ export function OrganisationView({
               <button
                 type="button"
                 onClick={() => setBulkImportOpen(true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.07] hover:bg-slate-200 dark:hover:bg-white/[0.12] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-[#F3F5F8] dark:bg-white/[0.07] hover:bg-slate-200/80 dark:hover:bg-white/[0.12] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
               >
                 <FolderInput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
                 <span>Bulk Import</span>
               </button>
 
-              <form onSubmit={handleCreateOrg} className="flex items-center gap-2">
+              {allWorkspaceProjects.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setExportProjectsOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-[#F3F5F8] dark:bg-white/[0.07] hover:bg-slate-200/80 dark:hover:bg-white/[0.12] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+                >
+                  <FileOutput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                  <span>Export Projects</span>
+                </button>
+              )}
+
+              <form onSubmit={handleCreateOrg} className="flex flex-wrap items-center gap-2">
                 <input
                   type="text"
                   value={newOrgName}
                   onChange={(e) => setNewOrgName(e.target.value)}
                   placeholder="New organisation name"
-                  className="w-48 sm:w-56 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                  className="w-44 sm:w-56 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3 py-2 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500"
                 />
                 <button
                   type="submit"
                   disabled={!newOrgName.trim()}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
                 >
                   <Plus className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
                   <span>Create Org</span>
@@ -465,8 +695,8 @@ export function OrganisationView({
           </section>
 
         {organisations.length === 0 ? (
-          <section className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-white/70 dark:bg-[#171A28]/60 px-6 py-14 text-center space-y-3">
-            <div className="w-10 h-10 rounded-xl bg-slate-100 dark:bg-white/[0.05] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center mx-auto text-slate-500 dark:text-slate-300">
+          <section className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-white/80 dark:bg-[#1B1F28]/70 px-6 py-14 text-center space-y-3">
+            <div className="w-10 h-10 rounded-xl bg-[#F3F5F8] dark:bg-white/[0.05] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center mx-auto text-slate-500 dark:text-slate-300">
               <Building2 className="w-5 h-5" strokeWidth={1.6} />
             </div>
             <div className="space-y-1 max-w-md mx-auto">
@@ -494,6 +724,7 @@ export function OrganisationView({
 
               const scheduleLabel = formatIntervalLabel(org.autoRefreshSec ?? 0);
               const windowLabel = formatCheckWindowLabel(org.checkWindow);
+              const orgMuted = showMaintenance && isMaintenanceActive(org.maintenanceUntil, nowMs);
 
               return (
                 <button
@@ -502,18 +733,27 @@ export function OrganisationView({
                   onClick={() => {
                     onChangeOpenedOrgId(org.id);
                     onChangeStatusFilter('all');
-                    setErrorMessage(null);
+                    resetProjectForm();
+                    setMaintenancePanelOpen(false);
                   }}
-                  className="w-full text-left rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1C2032] px-5 py-4 flex items-center justify-between gap-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+                  className="w-full text-left rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] hover:bg-slate-50 dark:hover:bg-[#222734] px-4 sm:px-5 py-3.5 sm:py-4 flex items-center justify-between gap-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                 >
                   <div className="flex items-center gap-3.5 min-w-0 flex-1">
-                    <div className="w-9 h-9 rounded-lg bg-slate-100 dark:bg-white/[0.06] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center text-slate-700 dark:text-slate-200 shrink-0">
+                    <div className="w-9 h-9 rounded-lg bg-[#F3F5F8] dark:bg-white/[0.06] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center text-blue-600 dark:text-blue-400 shrink-0">
                       <Building2 className="w-4 h-4" strokeWidth={1.75} />
                     </div>
                     <div className="min-w-0">
-                      <p className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
-                        {org.name}
-                      </p>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <p className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                          {org.name}
+                        </p>
+                        {orgMuted && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/25 whitespace-nowrap shrink-0">
+                            <BellOff className="w-3 h-3 shrink-0" strokeWidth={1.75} />
+                            <span>Muted {formatMaintenanceRemaining(org.maintenanceUntil, nowMs)}</span>
+                          </span>
+                        )}
+                      </div>
                       <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums mt-0.5 truncate">
                         {org.projects.length} {org.projects.length === 1 ? 'project' : 'projects'} · {uniqueUrls.size} {uniqueUrls.size === 1 ? 'URL' : 'URLs'} · Timer: {scheduleLabel} · {windowLabel}
                       </p>
@@ -550,13 +790,21 @@ export function OrganisationView({
           onClose={() => setBulkImportOpen(false)}
           onConfirmImport={handleBulkImportProjects}
         />
+        <ExportProjectsModal
+          open={exportProjectsOpen}
+          orgName={
+            organisations.length === 1 ? organisations[0].name : 'All Organisations'
+          }
+          projects={allWorkspaceProjects}
+          onClose={() => setExportProjectsOpen(false)}
+        />
       </>
     );
   }
 
   // LEVEL 2: Opened Organisation -> Projects & URLs under it
   return (
-    <div className="flex-1 flex flex-col min-w-0 h-full overflow-y-auto p-6 lg:p-8 space-y-6">
+    <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 sm:p-6 lg:p-7 space-y-5">
       {/* Breadcrumb + Run All Actions */}
       <section className="flex flex-wrap items-center justify-between gap-4">
         <div className="space-y-1">
@@ -564,10 +812,8 @@ export function OrganisationView({
             type="button"
             onClick={() => {
               onChangeOpenedOrgId(null);
-              setEditingProjectId(null);
-              setProjectName('');
-              setProjectUrlsInput('');
-              setErrorMessage(null);
+              resetProjectForm();
+              setMaintenancePanelOpen(false);
             }}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100 transition-colors whitespace-nowrap"
           >
@@ -575,10 +821,31 @@ export function OrganisationView({
             <span>Back to Organisations</span>
           </button>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
               {activeOrg.name}
             </h2>
+            {showMaintenance && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMaintenanceReasonInput(activeOrg.maintenanceReason || '');
+                  setMaintenancePanelOpen((prev) => !prev);
+                }}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
+                  isMaintenanceActive(activeOrg.maintenanceUntil, nowMs)
+                    ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                    : 'text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] hover:bg-slate-100 dark:hover:bg-white/[0.06]'
+                }`}
+              >
+                <BellOff className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>
+                  {isMaintenanceActive(activeOrg.maintenanceUntil, nowMs)
+                    ? `Muted (${formatMaintenanceRemaining(activeOrg.maintenanceUntil, nowMs)})`
+                    : 'Maintenance'}
+                </span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setPendingConfirm({ kind: 'delete-org', org: activeOrg })}
@@ -593,210 +860,234 @@ export function OrganisationView({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
+        <div className="flex-1 min-w-[240px] flex flex-col items-end gap-1.5">
           {shareNotice && (
             <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
               {shareNotice}
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => setBulkImportOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-          >
-            <FolderInput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-            <span>Bulk Import</span>
-          </button>
-          {sortedProjects.length > 0 && (
-            <button
-              type="button"
-              onClick={() => setExportProjectsOpen(true)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-            >
-              <FileOutput className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-              <span>Export Projects</span>
-            </button>
-          )}
-          {allLatestOrgResults.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={() =>
-                  exportResultsToCsv(
-                    allLatestOrgResults,
-                    `upsite-${activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
-                  )
-                }
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-              >
-                <Download className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-                <span>Export CSV</span>
-              </button>
-              <button
-                type="button"
-                onClick={() =>
-                  exportResultsToPdf(
-                    allLatestOrgResults,
-                    `upsite-${activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
-                  )
-                }
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-              >
-                <FileText className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-                <span>Export PDF</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-                  void shareResultsPdf(
-                    allLatestOrgResults,
-                    `upsite-${slug}`,
-                    `${activeOrg.name} — Availability Report`,
-                  )
-                    .then(showShareNotice)
-                    .catch(() => showShareNotice('Unable to share PDF.'));
-                }}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-              >
-                <Share2 className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-                <span>Share PDF</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-                  void copyResultsReport(
-                    allLatestOrgResults,
-                    `upsite-${slug}`,
-                    `${activeOrg.name} — Availability Report`,
-                  )
-                    .then(showShareNotice)
-                    .catch(() => showShareNotice('Clipboard copy unavailable.'));
-                }}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-              >
-                <Copy className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-                <span>Copy Report</span>
-              </button>
-            </>
-          )}
-
-          <button
-            type="button"
-            disabled={allOrgUrls.length === 0 || Boolean(runningScope)}
-            onClick={() => void handleRunAllInOrg()}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-45"
-          >
-            {runningScope === 'all' ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" strokeWidth={2} />
-            ) : (
-              <Play className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
-            )}
-            <span>{runningScope === 'all' ? 'Running All...' : 'Run All At Once'}</span>
-          </button>
+          <ReportActionBar
+            hasReportData={allLatestOrgResults.length > 0}
+            onBulkImport={() => setBulkImportOpen(true)}
+            onExportProjects={
+              sortedProjects.length > 0 ? () => setExportProjectsOpen(true) : undefined
+            }
+            onExportCsv={() =>
+              exportResultsToCsv(
+                allLatestOrgResults,
+                `upsite-${activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+              )
+            }
+            onExportPdf={() =>
+              exportResultsToPdf(
+                allLatestOrgResults,
+                `upsite-${activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+              )
+            }
+            onExportStatusPage={
+              showAnalytics
+                ? () => {
+                    exportStatusPageHtml({
+                      title: `${activeOrg.name} — Service Status`,
+                      subtitle: `${sortedProjects.length} projects · ${allLatestOrgResults.length} monitored endpoints`,
+                      organisations: [activeOrg],
+                    });
+                  }
+                : undefined
+            }
+            onSharePdf={() => {
+              const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              return shareResultsPdf(
+                allLatestOrgResults,
+                `upsite-${slug}`,
+                `${activeOrg.name} — Availability Report`,
+              );
+            }}
+            onCopyReport={() => {
+              const slug = activeOrg.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              return copyResultsReport(
+                allLatestOrgResults,
+                `upsite-${slug}`,
+                `${activeOrg.name} — Availability Report`,
+              );
+            }}
+            onBuildReportPayload={() =>
+              buildReportDispatchPayloadFromResults(
+                allLatestOrgResults,
+                `${activeOrg.name} — Availability Report`,
+                `${sortedProjects.length} projects · ${allLatestOrgResults.length} URLs`,
+              )
+            }
+            integrations={integrations}
+            onSendToApps={onSendToApps}
+            onOpenIntegrationsSettings={onOpenIntegrationsSettings}
+            primaryAction={{
+              label: 'Run All At Once',
+              runningLabel: 'Running All...',
+              countBadge: allOrgUrls.length,
+              disabled: allOrgUrls.length === 0 || Boolean(runningScope),
+              isRunning: runningScope === 'all',
+              onClick: () => void handleRunAllInOrg(),
+            }}
+          />
         </div>
       </section>
 
-      {/* Check Timer (Frequency) & Active Time Period (Day & Time Range) */}
-      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] px-5 py-4 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
-            <Clock className="w-4 h-4 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.75} />
-            <div className="min-w-0">
-              <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                Check Timer ({formatIntervalLabel(activeIntervalSec)})
-              </p>
+      {showMaintenance &&
+        (maintenancePanelOpen || isMaintenanceActive(activeOrg.maintenanceUntil, nowMs)) && (
+          <section className="rounded-xl border border-amber-500/30 bg-amber-500/[0.08] px-4 sm:px-5 py-3.5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <BellOff className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" strokeWidth={1.8} />
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
+                    {isMaintenanceActive(activeOrg.maintenanceUntil, nowMs)
+                      ? `Maintenance Window Active — Alerts muted for ${formatMaintenanceRemaining(activeOrg.maintenanceUntil, nowMs)}`
+                      : 'Schedule Maintenance Window (Mute Alerts)'}
+                  </p>
+                  <p className="text-[11px] text-amber-800/80 dark:text-amber-300/80">
+                    {activeOrg.maintenanceReason
+                      ? `Reason: ${activeOrg.maintenanceReason}`
+                      : 'Checks continue recording uptime, while desktop & connected-app alerts stay muted.'}
+                  </p>
+                </div>
+              </div>
+
+              {isMaintenanceActive(activeOrg.maintenanceUntil, nowMs) && (
+                <button
+                  type="button"
+                  onClick={() => handleSetOrgMaintenance(null)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-600 hover:bg-amber-500 text-white transition-colors whitespace-nowrap shrink-0"
+                >
+                  Resume Alerts
+                </button>
+              )}
+            </div>
+
+            {maintenancePanelOpen && (
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-amber-500/20">
+                <input
+                  type="text"
+                  value={maintenanceReasonInput}
+                  onChange={(e) => setMaintenanceReasonInput(e.target.value)}
+                  placeholder="Optional reason (e.g. Server deploy or DNS migration)"
+                  maxLength={120}
+                  className="flex-1 min-w-[200px] rounded-lg bg-white dark:bg-[#12151C] border border-amber-500/30 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-amber-500"
+                />
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {[
+                    { label: '30m', min: 30 },
+                    { label: '1h', min: 60 },
+                    { label: '4h', min: 240 },
+                    { label: '24h', min: 1440 },
+                  ].map((opt) => (
+                    <button
+                      key={opt.min}
+                      type="button"
+                      onClick={() => handleSetOrgMaintenance(opt.min)}
+                      className="px-2.5 py-1.5 rounded-md text-xs font-medium bg-white dark:bg-[#1B1F28] border border-amber-500/30 text-amber-900 dark:text-amber-200 hover:bg-amber-500/15 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      Mute {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+      {/* Simplified Timer Bar & Time Period Bar */}
+      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] px-4 sm:px-5 py-4 space-y-4">
+        <div className="space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
+              <Clock className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" strokeWidth={1.8} />
+              <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                Timer ({formatIntervalLabel(activeIntervalSec)})
+              </span>
               {activeIntervalSec > 0 && allOrgUrls.length > 0 && countdownSec !== null && nextCycleAt ? (
-                <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                <span className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
                   {inActiveWindow
-                    ? `Countdown: ${formatCountdown(countdownSec)} · Next cycle: ${nextCycleAt}`
-                    : `Paused outside time period (${formatCheckWindowLabel(activeWindow)})`}
-                </p>
+                    ? `· Next in ${formatCountdown(countdownSec)} (${nextCycleAt})`
+                    : `· Paused outside time period`}
+                </span>
               ) : activeIntervalSec > 0 ? (
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Add at least one project URL to start the check timer.
-                </p>
-              ) : (
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Set how frequently {activeOrg.name} should check all projects automatically.
-                </p>
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · Add a project URL to start
+                </span>
+              ) : !isPresetInterval && activeIntervalSec > 0 ? null : (
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  · Auto-check frequency
+                </span>
               )}
             </div>
           </div>
 
-          <div
-            role="group"
-            aria-label="Organisation check timer presets"
-            className="inline-flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.07]"
-          >
-            {AUTO_REFRESH_PRESETS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => handleSetOrgAutoRefresh(opt.value)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium tabular-nums transition-colors whitespace-nowrap shrink-0 ${
-                  activeIntervalSec === opt.value
-                    ? 'bg-white dark:bg-white/[0.12] text-slate-900 dark:text-white'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                }`}
+          <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.08] px-3 py-2">
+            <div
+              role="group"
+              aria-label="Organisation check timer presets"
+              className="flex flex-wrap items-center gap-1"
+            >
+              {AUTO_REFRESH_PRESETS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => handleSetOrgAutoRefresh(opt.value)}
+                  className={`px-2.5 py-1 rounded-md text-xs font-medium tabular-nums transition-colors whitespace-nowrap shrink-0 ${
+                    activeIntervalSec === opt.value
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-white/70 dark:hover:bg-white/[0.06]'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
+            <form
+              onSubmit={handleApplyCustomOrgPeriod}
+              className="flex items-center gap-1.5"
+            >
+              <input
+                type="number"
+                min={1}
+                max={customPeriodUnit === 'hr' ? 24 : 1440}
+                value={customPeriodVal}
+                onChange={(e) => {
+                  setCustomPeriodVal(e.target.value);
+                  setCustomPeriodError(null);
+                }}
+                placeholder="Custom"
+                aria-label="Organisation custom timer frequency value"
+                className="w-20 rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-2.5 py-1 text-xs font-mono tabular-nums text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+              />
+              <select
+                aria-label="Organisation custom timer frequency unit"
+                value={customPeriodUnit}
+                onChange={(e) => setCustomPeriodUnit(e.target.value as 'min' | 'hr')}
+                className="rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-2 py-1 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
               >
-                {opt.label}
+                <option value="min">min</option>
+                <option value="hr">hr</option>
+              </select>
+              <button
+                type="submit"
+                className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.12] dark:hover:bg-white/[0.18] text-white transition-colors whitespace-nowrap shrink-0"
+              >
+                Set
               </button>
-            ))}
+            </form>
           </div>
+
+          {customPeriodError && (
+            <p className="text-xs text-rose-600 dark:text-rose-400">{customPeriodError}</p>
+          )}
         </div>
-
-        <form
-          onSubmit={handleApplyCustomOrgPeriod}
-          className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-white/[0.06]"
-        >
-          <span className="text-xs text-slate-500 dark:text-slate-400">
-            {!isPresetInterval && activeIntervalSec > 0
-              ? `Custom timer active: Every ${formatIntervalLabel(activeIntervalSec)}`
-              : 'Custom timer frequency (1 min – 24 hr)'}
-          </span>
-
-          <div className="flex items-center gap-2">
-            <input
-              type="number"
-              min={1}
-              max={customPeriodUnit === 'hr' ? 24 : 1440}
-              value={customPeriodVal}
-              onChange={(e) => {
-                setCustomPeriodVal(e.target.value);
-                setCustomPeriodError(null);
-              }}
-              placeholder="e.g. 15"
-              aria-label="Organisation custom timer frequency value"
-              className="w-24 rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3 py-1.5 text-xs font-mono tabular-nums text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
-            />
-            <select
-              aria-label="Organisation custom timer frequency unit"
-              value={customPeriodUnit}
-              onChange={(e) => setCustomPeriodUnit(e.target.value as 'min' | 'hr')}
-              className="rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rose-500"
-            >
-              <option value="min">min</option>
-              <option value="hr">hr</option>
-            </select>
-            <button
-              type="submit"
-              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.1] dark:hover:bg-white/[0.16] text-white transition-colors whitespace-nowrap shrink-0"
-            >
-              Set Timer
-            </button>
-          </div>
-        </form>
-
-        {customPeriodError && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">{customPeriodError}</p>
-        )}
 
         <div className="pt-3 border-t border-slate-200 dark:border-white/[0.06]">
           <CheckWindowPicker
-            title="Check Time Period"
-            description="Select start and end day and time (e.g. Monday 12:00 AM to Sunday 11:59 PM) for when timer checks execute."
+            title="Time Period"
             value={activeOrg.checkWindow}
             onChange={handleSetOrgCheckWindow}
           />
@@ -804,7 +1095,7 @@ export function OrganisationView({
       </section>
 
       {/* Add / Edit Project Record Form */}
-      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] p-5">
+      <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] p-4 sm:p-5">
         <form onSubmit={handleSaveProject} className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <h3 className="text-xs font-semibold text-slate-800 dark:text-slate-200">
@@ -813,11 +1104,7 @@ export function OrganisationView({
             {editingProjectId && (
               <button
                 type="button"
-                onClick={() => {
-                  setEditingProjectId(null);
-                  setProjectName('');
-                  setProjectUrlsInput('');
-                }}
+                onClick={resetProjectForm}
                 className="text-xs text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 whitespace-nowrap"
               >
                 Cancel Edit
@@ -839,7 +1126,7 @@ export function OrganisationView({
                 value={projectName}
                 onChange={(e) => setProjectName(e.target.value)}
                 placeholder="e.g. Client Storefront"
-                className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500"
               />
             </div>
 
@@ -856,10 +1143,131 @@ export function OrganisationView({
                 value={projectUrlsInput}
                 onChange={(e) => setProjectUrlsInput(e.target.value)}
                 placeholder="https://example.com&#10;https://api.example.com"
-                className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500 resize-y"
+                className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500 resize-y"
               />
             </div>
           </div>
+
+          {showAdvancedRulesSection && (
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={() => setAdvancedRulesOpen((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span>
+                  {advancedRulesOpen
+                    ? 'Hide Advanced Check Rules'
+                    : 'Advanced Check Rules (Method, Status Codes, Keywords, Headers)'}
+                </span>
+              </button>
+
+              {advancedRulesOpen && (
+                <div className="mt-3 rounded-lg border border-slate-200 dark:border-white/[0.08] bg-[#F3F5F8] dark:bg-[#12151C] p-3.5 space-y-3">
+                  {showCustomRules && (
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="project-rule-method"
+                          className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                        >
+                          HTTP Method
+                        </label>
+                        <select
+                          id="project-rule-method"
+                          value={ruleMethod}
+                          onChange={(e) =>
+                            setRuleMethod(e.target.value as 'GET' | 'HEAD' | 'POST')
+                          }
+                          className="w-full rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                        >
+                          <option value="GET">GET</option>
+                          <option value="HEAD">HEAD</option>
+                          <option value="POST">POST</option>
+                        </select>
+                      </div>
+
+                      <div className="sm:col-span-2 space-y-1">
+                        <label
+                          htmlFor="project-rule-statuses"
+                          className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                        >
+                          Expected HTTP Status Codes (optional, comma-separated)
+                        </label>
+                        <input
+                          id="project-rule-statuses"
+                          type="text"
+                          value={ruleExpectedStatuses}
+                          onChange={(e) => setRuleExpectedStatuses(e.target.value)}
+                          placeholder="Default: 200–399 (e.g. 200, 204, 401)"
+                          className="w-full rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {showKeywordChecks && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="project-rule-expected-kw"
+                          className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                        >
+                          Required Page Keyword (must appear)
+                        </label>
+                        <input
+                          id="project-rule-expected-kw"
+                          type="text"
+                          value={ruleExpectedKeyword}
+                          onChange={(e) => setRuleExpectedKeyword(e.target.value)}
+                          placeholder="e.g. Welcome to Storefront"
+                          maxLength={120}
+                          className="w-full rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="project-rule-forbidden-kw"
+                          className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                        >
+                          Forbidden Error Keyword (fail if present)
+                        </label>
+                        <input
+                          id="project-rule-forbidden-kw"
+                          type="text"
+                          value={ruleForbiddenKeyword}
+                          onChange={(e) => setRuleForbiddenKeyword(e.target.value)}
+                          placeholder="e.g. Fatal error or Maintenance"
+                          maxLength={120}
+                          className="w-full rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {showCustomRules && (
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="project-rule-headers"
+                        className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                      >
+                        Custom Request Headers (optional, one per line: Header-Name: value)
+                      </label>
+                      <textarea
+                        id="project-rule-headers"
+                        rows={2}
+                        value={ruleHeadersInput}
+                        onChange={(e) => setRuleHeadersInput(e.target.value)}
+                        placeholder="X-Health-Check: upsite&#10;Accept: application/json"
+                        className="w-full rounded-md bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.08] px-3 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-blue-500 resize-y"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {errorMessage && (
             <div
@@ -873,7 +1281,7 @@ export function OrganisationView({
           <div className="flex justify-end">
             <button
               type="submit"
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.09] dark:hover:bg-white/[0.15] text-white transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.1] dark:hover:bg-white/[0.16] text-white transition-colors whitespace-nowrap shrink-0"
             >
               <FolderPlus className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
               <span>{editingProjectId ? 'Save Project' : 'Add Project'}</span>
@@ -885,7 +1293,7 @@ export function OrganisationView({
       {/* Filter Bar */}
       {allLatestOrgResults.length > 0 && (
         <div className="flex items-center justify-between gap-4">
-          <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#171A28] border border-slate-200 dark:border-white/[0.07]">
+          <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg bg-white dark:bg-[#1B1F28] border border-slate-200 dark:border-white/[0.07]">
             {(
               [
                 { id: 'all', label: 'All' },
@@ -901,7 +1309,7 @@ export function OrganisationView({
                 onClick={() => onChangeStatusFilter(tab.id)}
                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   statusFilter === tab.id
-                    ? 'bg-slate-900 text-white dark:bg-white/[0.1] dark:text-white'
+                    ? 'bg-blue-600 text-white'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                 }`}
               >
@@ -914,7 +1322,7 @@ export function OrganisationView({
 
       {/* Projects & URLs under Active Organisation */}
       {activeOrg.projects.length === 0 ? (
-        <div className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-white/60 dark:bg-[#171A28]/60 px-6 py-10 text-center text-xs text-slate-500 dark:text-slate-400">
+        <div className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-white/70 dark:bg-[#1B1F28]/60 px-6 py-10 text-center text-xs text-slate-500 dark:text-slate-400">
           No projects added to {activeOrg.name} yet. Fill in a project name and URLs above.
         </div>
       ) : (
@@ -944,11 +1352,16 @@ export function OrganisationView({
             const lastCheckedLabel = formatLastCheckedAt(
               project.lastCheckedAt || project.lastResults?.[0]?.checkedAt,
             );
+            const rulesSummary = formatRulesSummary(
+              project.checkRules,
+              showCustomRules,
+              showKeywordChecks,
+            );
 
             return (
               <section
                 key={project.id}
-                className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#171A28] overflow-hidden"
+                className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] overflow-hidden"
               >
                 <div className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
                   <button
@@ -975,6 +1388,7 @@ export function OrganisationView({
                         {project.lastResults && project.lastResults.length > 0
                           ? ` · ${onlineCount} Online · ${issueCount} Issue`
                           : ''}
+                        {rulesSummary ? ` · Rules: ${rulesSummary}` : ''}
                         {lastCheckedLabel
                           ? ` · Last checked: ${lastCheckedLabel}`
                           : ' · Not checked yet'}
@@ -1069,8 +1483,8 @@ export function OrganisationView({
                           onClick={() => onSelectResult(result)}
                           className={`w-full text-left px-5 ${isCompact ? 'py-2.5' : 'py-3.5'} flex items-center justify-between gap-4 transition-colors ${
                             isSelected
-                              ? 'bg-rose-50/70 dark:bg-[#1F2437]'
-                              : 'hover:bg-slate-50 dark:hover:bg-[#1C2032]'
+                              ? 'bg-blue-50/70 dark:bg-blue-500/[0.08]'
+                              : 'hover:bg-slate-50 dark:hover:bg-[#222734]'
                           }`}
                         >
                           <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -1124,7 +1538,7 @@ export function OrganisationView({
           aria-labelledby="org-report-prompt-title"
           className="fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-[1px] flex items-center justify-center p-4"
         >
-          <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-2xl p-6 space-y-5">
+          <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#1B1F28] shadow-2xl p-6 space-y-5">
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-1">
                 <h3
@@ -1147,7 +1561,7 @@ export function OrganisationView({
               </button>
             </div>
 
-            <div className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-slate-50 dark:bg-[#10121C] px-4 py-3 flex items-center justify-between gap-4 text-xs font-mono tabular-nums">
+            <div className="rounded-xl border border-slate-200 dark:border-white/[0.07] bg-[#F3F5F8] dark:bg-[#12151C] px-4 py-3 flex items-center justify-between gap-4 text-xs font-mono tabular-nums">
               <span className="text-slate-600 dark:text-slate-300">
                 Total: {pendingReport.rows.length}
               </span>
@@ -1177,6 +1591,16 @@ export function OrganisationView({
               >
                 Cancel
               </button>
+              {onSendToApps && (
+                <button
+                  type="button"
+                  onClick={() => setSendPendingOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-500/15 hover:bg-blue-100 dark:hover:bg-blue-500/25 transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Send className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                  <span>Send to App</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -1218,7 +1642,7 @@ export function OrganisationView({
                   exportSimpleOrgReportCsv(pendingReport.orgName, pendingReport.rows);
                   onDismissPendingReport();
                 }}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0"
               >
                 <Download className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
                 <span>Download CSV</span>
@@ -1226,6 +1650,33 @@ export function OrganisationView({
             </div>
           </div>
         </div>
+      )}
+
+      {onSendToApps && pendingReport && (
+        <SendReportModal
+          open={sendPendingOpen}
+          report={buildReportDispatchPayloadFromOrgRows(
+            pendingReport.orgName,
+            pendingReport.rows,
+            pendingReport.scopeLabel,
+          )}
+          integrations={integrations}
+          onClose={() => setSendPendingOpen(false)}
+          onSend={async (reportPayload, channelIds) => {
+            const res = await onSendToApps(reportPayload, channelIds);
+            if (res.sentCount > 0) {
+              showModalShareNotice(
+                `Report sent to ${res.sentCount} ${res.sentCount === 1 ? 'app' : 'apps'}.`,
+              );
+            }
+            return res;
+          }}
+          onOpenSettings={() => {
+            setSendPendingOpen(false);
+            onDismissPendingReport();
+            onOpenIntegrationsSettings?.();
+          }}
+        />
       )}
 
       <ConfirmModal

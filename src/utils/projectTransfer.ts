@@ -8,6 +8,8 @@ export interface ImportedProjectDraft {
   sourceHint?: string;
 }
 
+export type ImportConflictMode = 'merge' | 'skip' | 'duplicate';
+
 export interface UpsiteProjectBundle {
   format: 'upsite-projects-v1';
   exportedAt: string;
@@ -17,6 +19,8 @@ export interface UpsiteProjectBundle {
     urls: string[];
   }>;
 }
+
+const MAX_URLS_PER_PROJECT = 50;
 
 const TWO_PART_SUFFIXES = new Set([
   'co.uk',
@@ -53,9 +57,20 @@ function slugify(value: string, fallback = 'org'): string {
   );
 }
 
+function stripBomAndFormulaEscape(value: string): string {
+  return value.replace(/^\uFEFF/, '').replace(/^'(?=[=+\-@\t\r])/, '');
+}
+
 function sanitizeProjectName(raw: string, fallback = 'Imported Project'): string {
-  const cleaned = raw.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 80);
+  const cleaned = stripBomAndFormulaEscape(raw).replace(/[\r\n\t]+/g, ' ').trim().slice(0, 80);
   return cleaned || fallback;
+}
+
+function cleanUrlToken(raw: string): string {
+  return stripBomAndFormulaEscape(raw)
+    .trim()
+    .replace(/^[<("']+/, '')
+    .replace(/[>),;"']+$/, '');
 }
 
 function escapeCsvField(value: string | number | null | undefined): string {
@@ -81,33 +96,58 @@ function downloadBlob(blob: Blob, filename: string): void {
 }
 
 export function parseRawUrlTokens(raw: string): string[] {
-  const tokens = raw
-    .split(/[\n,;\s]+/)
-    .map((item) => item.trim())
+  // Extract HTML href / markdown links alongside plain URL tokens
+  const extracted: string[] = [];
+  const hrefRegex = /href\s*=\s*["']([^"']+)["']/gi;
+  let match: RegExpExecArray | null;
+  while ((match = hrefRegex.exec(raw)) !== null) {
+    if (match[1]) extracted.push(match[1]);
+  }
+  const mdLinkRegex = /\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/gi;
+  while ((match = mdLinkRegex.exec(raw)) !== null) {
+    if (match[1]) extracted.push(match[1]);
+  }
+
+  const normalizedSource = raw
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/gi, ' $1 ');
+
+  const tokens = normalizedSource
+    .split(/[\n,;\s\t]+/)
+    .map(cleanUrlToken)
     .filter(Boolean);
-  return Array.from(new Set(tokens));
+
+  return Array.from(new Set([...extracted.map(cleanUrlToken).filter(Boolean), ...tokens]));
 }
 
 export function extractDomainGroupKey(
   rawUrl: string,
   defaultProtocol: 'https' | 'http' = 'https',
 ): string | null {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) return null;
+  const trimmed = cleanUrlToken(rawUrl);
+  if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('javascript:')) return null;
+  if (!trimmed.includes('.') && !trimmed.includes('localhost')) return null;
+
   const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  if (hasScheme && !/^https?:\/\//i.test(trimmed)) return null;
+
   const candidate = hasScheme ? trimmed : `${defaultProtocol}://${trimmed}`;
   try {
     const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
     const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
     if (!host) return null;
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) {
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost') {
       return host;
     }
     const labels = host.split('.').filter(Boolean);
-    if (labels.length <= 2) {
+    if (labels.length < 2) return null;
+    const tld = labels[labels.length - 1];
+    if (!/^[a-z]{2,}$/i.test(tld)) return null;
+    if (labels.length === 2) {
       return host;
     }
-    const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
+    const lastTwo = `${labels[labels.length - 2]}.${tld}`;
     if (TWO_PART_SUFFIXES.has(lastTwo) && labels.length >= 3) {
       return labels.slice(-3).join('.');
     }
@@ -117,42 +157,87 @@ export function extractDomainGroupKey(
   }
 }
 
-export function groupUrlsByDomain(
+function splitLargeProjectUrls(
+  baseName: string,
+  urls: string[],
+  sourceHint?: string,
+): ImportedProjectDraft[] {
+  const uniqueUrls = Array.from(new Set(urls.map(cleanUrlToken).filter(Boolean)));
+  if (uniqueUrls.length === 0) return [];
+  if (uniqueUrls.length <= MAX_URLS_PER_PROJECT) {
+    return [
+      {
+        tempId: crypto.randomUUID(),
+        name: sanitizeProjectName(baseName),
+        urls: uniqueUrls,
+        sourceHint,
+      },
+    ];
+  }
+
+  const parts: ImportedProjectDraft[] = [];
+  for (let i = 0; i < uniqueUrls.length; i += MAX_URLS_PER_PROJECT) {
+    const partIndex = Math.floor(i / MAX_URLS_PER_PROJECT) + 1;
+    parts.push({
+      tempId: crypto.randomUUID(),
+      name: sanitizeProjectName(
+        partIndex === 1 ? baseName : `${baseName} (Part ${partIndex})`,
+      ),
+      urls: uniqueUrls.slice(i, i + MAX_URLS_PER_PROJECT),
+      sourceHint,
+    });
+  }
+  return parts;
+}
+
+export function groupUrlsByDomainWithStats(
   rawText: string,
   defaultProtocol: 'https' | 'http' = 'https',
-): ImportedProjectDraft[] {
+): { projects: ImportedProjectDraft[]; skippedCount: number } {
   const tokens = parseRawUrlTokens(rawText);
   const grouped = new Map<string, string[]>();
+  let skippedCount = 0;
 
   for (const token of tokens) {
     const domain = extractDomainGroupKey(token, defaultProtocol);
-    if (!domain) continue;
+    if (!domain) {
+      skippedCount += 1;
+      continue;
+    }
     const list = grouped.get(domain) || [];
-    if (!list.includes(token) && list.length < 50) {
+    if (!list.includes(token)) {
       list.push(token);
       grouped.set(domain, list);
     }
   }
 
-  return Array.from(grouped.entries())
-    .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }))
-    .map(([domain, urls]) => ({
-      tempId: crypto.randomUUID(),
-      name: domain,
-      urls,
-      sourceHint: `Domain: ${domain}`,
-    }));
+  const drafts: ImportedProjectDraft[] = [];
+  for (const [domain, urls] of Array.from(grouped.entries()).sort(([a], [b]) =>
+    a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }),
+  )) {
+    drafts.push(...splitLargeProjectUrls(domain, urls, `Domain: ${domain}`));
+  }
+
+  return { projects: drafts, skippedCount };
 }
 
-function parseCsvRows(text: string): string[][] {
+export function groupUrlsByDomain(
+  rawText: string,
+  defaultProtocol: 'https' | 'http' = 'https',
+): ImportedProjectDraft[] {
+  return groupUrlsByDomainWithStats(rawText, defaultProtocol).projects;
+}
+
+function parseDelimitedRows(text: string, delimiter: ',' | '\t'): string[][] {
+  const cleanText = text.replace(/^\uFEFF/, '');
   const rows: string[][] = [];
   let row: string[] = [];
   let cell = '';
   let inQuotes = false;
 
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    const next = text[i + 1];
+  for (let i = 0; i < cleanText.length; i += 1) {
+    const ch = cleanText[i];
+    const next = cleanText[i + 1];
 
     if (inQuotes) {
       if (ch === '"' && next === '"') {
@@ -165,17 +250,17 @@ function parseCsvRows(text: string): string[][] {
       }
     } else if (ch === '"') {
       inQuotes = true;
-    } else if (ch === ',') {
-      row.push(cell.trim());
+    } else if (ch === delimiter) {
+      row.push(stripBomAndFormulaEscape(cell.trim()));
       cell = '';
     } else if (ch === '\r' && next === '\n') {
-      row.push(cell.trim());
+      row.push(stripBomAndFormulaEscape(cell.trim()));
       if (row.some((c) => c.length > 0)) rows.push(row);
       row = [];
       cell = '';
       i += 1;
     } else if (ch === '\n' || ch === '\r') {
-      row.push(cell.trim());
+      row.push(stripBomAndFormulaEscape(cell.trim()));
       if (row.some((c) => c.length > 0)) rows.push(row);
       row = [];
       cell = '';
@@ -185,7 +270,7 @@ function parseCsvRows(text: string): string[][] {
   }
 
   if (cell.length > 0 || row.length > 0) {
-    row.push(cell.trim());
+    row.push(stripBomAndFormulaEscape(cell.trim()));
     if (row.some((c) => c.length > 0)) rows.push(row);
   }
 
@@ -195,41 +280,52 @@ function parseCsvRows(text: string): string[][] {
 function normalizeProjectList(
   items: Array<{ name?: unknown; urls?: unknown }>,
   sourceHint: string,
-): ImportedProjectDraft[] {
+  defaultProtocol: 'https' | 'http',
+): { drafts: ImportedProjectDraft[]; skippedCount: number } {
   const drafts: ImportedProjectDraft[] = [];
+  let skippedCount = 0;
+
   for (const item of items) {
     if (!item || typeof item !== 'object') continue;
     const rawName = typeof item.name === 'string' ? item.name : '';
-    const urls = Array.isArray(item.urls)
-      ? Array.from(
-          new Set(
-            item.urls
-              .filter((u): u is string => typeof u === 'string')
-              .map((u) => u.trim())
-              .filter(Boolean),
-          ),
-        ).slice(0, 50)
-      : [];
-    if (urls.length === 0) continue;
-    drafts.push({
-      tempId: crypto.randomUUID(),
-      name: sanitizeProjectName(rawName, extractDomainGroupKey(urls[0]) || 'Imported Project'),
-      urls,
-      sourceHint,
-    });
+    const validUrls: string[] = [];
+
+    if (Array.isArray(item.urls)) {
+      for (const rawUrl of item.urls) {
+        if (typeof rawUrl !== 'string') continue;
+        const cleaned = cleanUrlToken(rawUrl);
+        if (!cleaned) continue;
+        if (!extractDomainGroupKey(cleaned, defaultProtocol)) {
+          skippedCount += 1;
+          continue;
+        }
+        if (!validUrls.includes(cleaned)) {
+          validUrls.push(cleaned);
+        }
+      }
+    }
+
+    if (validUrls.length === 0) continue;
+    const baseName = sanitizeProjectName(
+      rawName,
+      extractDomainGroupKey(validUrls[0], defaultProtocol) || 'Imported Project',
+    );
+    drafts.push(...splitLargeProjectUrls(baseName, validUrls, sourceHint));
   }
-  return drafts.sort((a, b) =>
+
+  drafts.sort((a, b) =>
     a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }),
   );
+  return { drafts, skippedCount };
 }
 
 export function parseProjectsFromFileContent(
   filename: string,
   content: string,
   defaultProtocol: 'https' | 'http' = 'https',
-): { projects: ImportedProjectDraft[]; summary: string } {
+): { projects: ImportedProjectDraft[]; summary: string; skippedCount: number } {
   const lowerName = filename.toLowerCase();
-  const trimmed = content.trim();
+  const trimmed = content.replace(/^\uFEFF/, '').trim();
   if (!trimmed) {
     throw new Error('The selected file is empty.');
   }
@@ -239,6 +335,8 @@ export function parseProjectsFromFileContent(
     lowerName.endsWith('.json') ||
     (!lowerName.endsWith('.txt') &&
       !lowerName.endsWith('.csv') &&
+      !lowerName.endsWith('.tsv') &&
+      !lowerName.endsWith('.html') &&
       (trimmed.startsWith('{') || trimmed.startsWith('[')))
   ) {
     let parsed: unknown;
@@ -249,28 +347,35 @@ export function parseProjectsFromFileContent(
     }
 
     if (Array.isArray(parsed)) {
-      const drafts = normalizeProjectList(
+      const { drafts, skippedCount } = normalizeProjectList(
         parsed as Array<{ name?: unknown; urls?: unknown }>,
         'JSON list',
+        defaultProtocol,
       );
       if (drafts.length === 0) {
         throw new Error('No valid projects with URLs were found in this JSON file.');
       }
-      return { projects: drafts, summary: `${drafts.length} project(s) read from JSON file` };
+      return {
+        projects: drafts,
+        skippedCount,
+        summary: `${drafts.length} project(s) read from JSON file`,
+      };
     }
 
     if (parsed && typeof parsed === 'object') {
       const obj = parsed as Record<string, unknown>;
       if (Array.isArray(obj.projects)) {
-        const drafts = normalizeProjectList(
+        const { drafts, skippedCount } = normalizeProjectList(
           obj.projects as Array<{ name?: unknown; urls?: unknown }>,
           typeof obj.sourceOrganisation === 'string'
             ? `From ${obj.sourceOrganisation}`
             : 'upsite bundle',
+          defaultProtocol,
         );
         if (drafts.length > 0) {
           return {
             projects: drafts,
+            skippedCount,
             summary: `${drafts.length} project(s) read from ${
               typeof obj.sourceOrganisation === 'string' ? obj.sourceOrganisation : 'JSON bundle'
             }`,
@@ -287,9 +392,17 @@ export function parseProjectsFromFileContent(
             );
           }
         }
-        const drafts = normalizeProjectList(combined, 'Organisation bundle');
+        const { drafts, skippedCount } = normalizeProjectList(
+          combined,
+          'Organisation bundle',
+          defaultProtocol,
+        );
         if (drafts.length > 0) {
-          return { projects: drafts, summary: `${drafts.length} project(s) read from JSON bundle` };
+          return {
+            projects: drafts,
+            skippedCount,
+            summary: `${drafts.length} project(s) read from JSON bundle`,
+          };
         }
       }
     }
@@ -297,75 +410,112 @@ export function parseProjectsFromFileContent(
     throw new Error('No projects with URLs were found in this JSON file.');
   }
 
-  // 2. CSV file (supports Project + URL columns or raw URL list)
-  if (lowerName.endsWith('.csv')) {
-    const rows = parseCsvRows(trimmed);
+  // 2. CSV or TSV file (supports Project + URL columns, upsite Simple Report CSV, or raw URL list)
+  if (lowerName.endsWith('.csv') || lowerName.endsWith('.tsv')) {
+    const delimiter = lowerName.endsWith('.tsv') ? '\t' : ',';
+    const rows = parseDelimitedRows(trimmed, delimiter);
     if (rows.length === 0) {
-      throw new Error('No rows found in this CSV file.');
+      throw new Error('No rows found in this spreadsheet file.');
     }
 
     const headerLower = rows[0].map((col) => col.toLowerCase().trim());
-    const projIdx = headerLower.findIndex((h) => h === 'project' || h === 'project name');
+    const projIdx = headerLower.findIndex(
+      (h) => h === 'project' || h === 'project name' || h === 'group' || h === 'folder',
+    );
     const urlIdx = headerLower.findIndex(
-      (h) => h === 'url' || h === 'normalized url' || h === 'website' || h === 'site',
+      (h) =>
+        h === 'url' ||
+        h === 'normalized url' ||
+        h === 'input url' ||
+        h === 'website' ||
+        h === 'site' ||
+        h === 'domain',
     );
 
     if (projIdx !== -1 && urlIdx !== -1 && rows.length > 1) {
       const grouped = new Map<string, string[]>();
+      let skippedCount = 0;
+
       for (let i = 1; i < rows.length; i += 1) {
         const r = rows[i];
-        const rawUrl = (r[urlIdx] || '').trim();
+        const rawUrl = cleanUrlToken(r[urlIdx] || '');
         if (!rawUrl) continue;
-        const projName = sanitizeProjectName(
-          r[projIdx] || '',
-          extractDomainGroupKey(rawUrl, defaultProtocol) || 'Imported Project',
-        );
+        const domainKey = extractDomainGroupKey(rawUrl, defaultProtocol);
+        if (!domainKey) {
+          skippedCount += 1;
+          continue;
+        }
+        const projName = sanitizeProjectName(r[projIdx] || '', domainKey);
         const list = grouped.get(projName) || [];
-        if (!list.includes(rawUrl) && list.length < 50) {
+        if (!list.includes(rawUrl)) {
           list.push(rawUrl);
           grouped.set(projName, list);
         }
       }
 
-      const drafts = Array.from(grouped.entries())
-        .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }))
-        .map(([name, urls]) => ({
-          tempId: crypto.randomUUID(),
-          name,
-          urls,
-          sourceHint: 'CSV Project column',
-        }));
+      const drafts: ImportedProjectDraft[] = [];
+      for (const [name, urls] of Array.from(grouped.entries()).sort(([a], [b]) =>
+        a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }),
+      )) {
+        drafts.push(...splitLargeProjectUrls(name, urls, 'Spreadsheet Project column'));
+      }
 
       if (drafts.length === 0) {
-        throw new Error('No valid URLs found in the CSV URL column.');
+        throw new Error('No valid URLs found in the spreadsheet URL column.');
       }
-      return { projects: drafts, summary: `${drafts.length} project(s) read from CSV` };
+      return {
+        projects: drafts,
+        skippedCount,
+        summary: `${drafts.length} project(s) read from ${lowerName.endsWith('.tsv') ? 'TSV' : 'CSV'}`,
+      };
     }
 
+    // Fallback: extract URL tokens from all spreadsheet cells
     const extractedUrls: string[] = [];
     for (let i = 0; i < rows.length; i += 1) {
       for (const cell of rows[i]) {
-        const clean = cell.trim();
-        if (clean && /[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/.test(clean)) {
+        const clean = cleanUrlToken(cell);
+        if (clean && extractDomainGroupKey(clean, defaultProtocol)) {
           extractedUrls.push(clean);
         }
       }
     }
-    const drafts = groupUrlsByDomain(extractedUrls.join('\n'), defaultProtocol);
+    const { projects: drafts, skippedCount } = groupUrlsByDomainWithStats(
+      extractedUrls.join('\n'),
+      defaultProtocol,
+    );
     if (drafts.length === 0) {
-      throw new Error('No valid URLs found in this CSV file.');
+      throw new Error('No valid URLs found in this spreadsheet file.');
     }
     return {
       projects: drafts,
-      summary: `${drafts.length} project(s) grouped by domain from CSV`,
+      skippedCount,
+      summary: `${drafts.length} project(s) grouped by domain from ${lowerName.endsWith('.tsv') ? 'TSV' : 'CSV'}`,
     };
   }
 
-  // 3. Plain text / URL list (supports optional [Project Name] or # Project Name headings)
+  // 3. Plain text / Markdown / HTML bookmarks (supports optional [Project Name] or # Project Name headings)
+  if (lowerName.endsWith('.html') || lowerName.endsWith('.htm')) {
+    const tokens = parseRawUrlTokens(trimmed);
+    const { projects: drafts, skippedCount } = groupUrlsByDomainWithStats(
+      tokens.join('\n'),
+      defaultProtocol,
+    );
+    if (drafts.length === 0) {
+      throw new Error('No valid HTTP/HTTPS bookmark URLs were found in this HTML file.');
+    }
+    return {
+      projects: drafts,
+      skippedCount,
+      summary: `${drafts.length} project(s) grouped from bookmarks`,
+    };
+  }
+
   const lines = trimmed.split(/\r?\n/);
   const sectioned = new Map<string, string[]>();
   let currentHeading: string | null = null;
   const unsectioned: string[] = [];
+  let skippedCount = 0;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -384,8 +534,10 @@ export function parseProjectsFromFileContent(
     if (currentHeading) {
       const list = sectioned.get(currentHeading) || [];
       for (const tok of tokens) {
-        if (extractDomainGroupKey(tok, defaultProtocol) && !list.includes(tok) && list.length < 50) {
-          list.push(tok);
+        if (extractDomainGroupKey(tok, defaultProtocol)) {
+          if (!list.includes(tok)) list.push(tok);
+        } else {
+          skippedCount += 1;
         }
       }
       if (list.length > 0) sectioned.set(currentHeading, list);
@@ -396,15 +548,12 @@ export function parseProjectsFromFileContent(
 
   const drafts: ImportedProjectDraft[] = [];
   for (const [name, urls] of sectioned.entries()) {
-    drafts.push({
-      tempId: crypto.randomUUID(),
-      name,
-      urls,
-      sourceHint: 'Text section',
-    });
+    drafts.push(...splitLargeProjectUrls(name, urls, 'Text section'));
   }
   if (unsectioned.length > 0) {
-    drafts.push(...groupUrlsByDomain(unsectioned.join('\n'), defaultProtocol));
+    const grouped = groupUrlsByDomainWithStats(unsectioned.join('\n'), defaultProtocol);
+    drafts.push(...grouped.projects);
+    skippedCount += grouped.skippedCount;
   }
 
   if (drafts.length === 0) {
@@ -416,7 +565,24 @@ export function parseProjectsFromFileContent(
   );
   return {
     projects: drafts,
+    skippedCount,
     summary: `${drafts.length} project(s) ready from ${filename}`,
+  };
+}
+
+export function buildSelectedProjectsBundle(
+  orgName: string,
+  projects: ProjectRecord[],
+): UpsiteProjectBundle {
+  const sorted = sortProjectsByName(projects);
+  return {
+    format: 'upsite-projects-v1',
+    exportedAt: new Date().toISOString(),
+    sourceOrganisation: orgName,
+    projects: sorted.map((p) => ({
+      name: p.name,
+      urls: [...p.urls],
+    })),
   };
 }
 
@@ -427,16 +593,7 @@ export function exportSelectedProjectsJson(
   const sorted = sortProjectsByName(projects);
   if (sorted.length === 0) return;
 
-  const bundle: UpsiteProjectBundle = {
-    format: 'upsite-projects-v1',
-    exportedAt: new Date().toISOString(),
-    sourceOrganisation: orgName,
-    projects: sorted.map((p) => ({
-      name: p.name,
-      urls: [...p.urls],
-    })),
-  };
-
+  const bundle = buildSelectedProjectsBundle(orgName, sorted);
   const blob = new Blob([JSON.stringify(bundle, null, 2)], {
     type: 'application/json;charset=utf-8;',
   });
@@ -464,33 +621,86 @@ export function exportSelectedProjectsCsv(
     ...rows.map((row) => row.map(escapeCsvField).join(',')),
   ].join('\r\n');
 
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  // Prepend UTF-8 BOM so Microsoft Excel preserves UTF-8 characters
+  const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
   const datePart = new Date().toISOString().slice(0, 10);
   downloadBlob(blob, `upsite-${slugify(orgName)}-projects-${datePart}.csv`);
+}
+
+export function exportSelectedProjectsTxt(
+  orgName: string,
+  projects: ProjectRecord[],
+): void {
+  const sorted = sortProjectsByName(projects);
+  if (sorted.length === 0) return;
+
+  const sections = sorted.map((p) => `[${p.name}]\n${p.urls.join('\n')}`);
+  const txtContent = sections.join('\n\n') + '\n';
+  const blob = new Blob([txtContent], { type: 'text/plain;charset=utf-8;' });
+  const datePart = new Date().toISOString().slice(0, 10);
+  downloadBlob(blob, `upsite-${slugify(orgName)}-projects-${datePart}.txt`);
+}
+
+export async function copySelectedProjectsBundle(
+  orgName: string,
+  projects: ProjectRecord[],
+): Promise<string> {
+  const sorted = sortProjectsByName(projects);
+  if (sorted.length === 0) return 'No projects selected.';
+  const bundle = buildSelectedProjectsBundle(orgName, sorted);
+  const text = JSON.stringify(bundle, null, 2);
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return `Copied ${sorted.length} ${sorted.length === 1 ? 'project' : 'projects'} bundle to clipboard.`;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+  return `Copied ${sorted.length} ${sorted.length === 1 ? 'project' : 'projects'} bundle to clipboard.`;
 }
 
 export function mergeImportedProjects(
   existingProjects: ProjectRecord[],
   draftsToImport: ImportedProjectDraft[],
-  mergeMatchingNames: boolean,
+  conflictModeOrMerge: ImportConflictMode | boolean,
 ): ProjectRecord[] {
+  const mode: ImportConflictMode =
+    typeof conflictModeOrMerge === 'boolean'
+      ? conflictModeOrMerge
+        ? 'merge'
+        : 'duplicate'
+      : conflictModeOrMerge;
+
   const next = existingProjects.map((p) => ({ ...p, urls: [...p.urls] }));
   const nowIso = new Date().toISOString();
 
   for (const draft of draftsToImport) {
     const cleanName = sanitizeProjectName(draft.name);
-    const cleanUrls = Array.from(new Set(draft.urls.map((u) => u.trim()).filter(Boolean))).slice(
-      0,
-      50,
-    );
+    const cleanUrls = Array.from(
+      new Set(draft.urls.map(cleanUrlToken).filter(Boolean)),
+    ).slice(0, MAX_URLS_PER_PROJECT);
     if (cleanUrls.length === 0) continue;
 
-    if (mergeMatchingNames) {
-      const existing = next.find(
-        (p) => p.name.trim().toLowerCase() === cleanName.toLowerCase(),
-      );
-      if (existing) {
-        existing.urls = Array.from(new Set([...existing.urls, ...cleanUrls])).slice(0, 50);
+    const existing = next.find(
+      (p) => p.name.trim().toLowerCase() === cleanName.toLowerCase(),
+    );
+
+    if (existing) {
+      if (mode === 'skip') {
+        continue;
+      }
+      if (mode === 'merge') {
+        existing.urls = Array.from(new Set([...existing.urls, ...cleanUrls])).slice(
+          0,
+          MAX_URLS_PER_PROJECT,
+        );
         continue;
       }
     }

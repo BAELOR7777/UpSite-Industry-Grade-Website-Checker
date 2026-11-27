@@ -1,7 +1,13 @@
 import { Activity, ArrowRight, Eye, EyeOff, KeyRound, Loader2, Lock, UserPlus } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import type { AuthUser, Organisation, SiteCheckResult, UserSettings } from '../types/upsite';
+import type {
+  AuthUser,
+  IncidentRecord,
+  Organisation,
+  SiteCheckResult,
+  UserSettings,
+} from '../types/upsite';
 
 type LoginTab = 'token' | 'register' | 'login';
 
@@ -12,6 +18,7 @@ export interface AuthSuccessPayload {
   workspace?: {
     history: SiteCheckResult[];
     organisations: Organisation[];
+    incidents?: IncidentRecord[];
     settings: UserSettings;
     checkerInput?: string;
   };
@@ -104,13 +111,13 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
   };
 
   return (
-    <div className="min-h-screen w-full bg-slate-100 dark:bg-[#0F111A] text-slate-900 dark:text-slate-100 flex items-center justify-center p-6">
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#151824] p-7 sm:p-8 space-y-6">
+    <div className="min-h-screen w-full bg-[#F3F5F8] dark:bg-[#111318] text-slate-900 dark:text-slate-100 flex items-center justify-center p-4 sm:p-6">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] shadow-xl p-6 sm:p-8 space-y-6">
         {/* Brand Header */}
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-slate-100 dark:bg-white/[0.06] border border-slate-200 dark:border-white/[0.08] flex items-center justify-center text-slate-900 dark:text-slate-100 shrink-0">
-              <Activity className="w-4 h-4" strokeWidth={1.8} />
+            <div className="w-9 h-9 rounded-lg bg-blue-600 dark:bg-blue-500 text-white flex items-center justify-center shadow-sm shrink-0">
+              <Activity className="w-4 h-4" strokeWidth={2} />
             </div>
             <div>
               <h1 className="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100">
@@ -147,7 +154,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
         <div
           role="tablist"
           aria-label="Login mode"
-          className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-slate-100 dark:bg-[#10121C] border border-slate-200 dark:border-white/[0.07]"
+          className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.07]"
         >
           <button
             type="button"
@@ -159,7 +166,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
             }}
             className={`px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
               activeTab === 'token'
-                ? 'bg-white dark:bg-white/[0.1] text-slate-900 dark:text-white'
+                ? 'bg-blue-600 text-white'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
             }`}
           >
@@ -175,7 +182,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
             }}
             className={`px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
               activeTab === 'register'
-                ? 'bg-white dark:bg-white/[0.1] text-slate-900 dark:text-white'
+                ? 'bg-blue-600 text-white'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
             }`}
           >
@@ -191,7 +198,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
             }}
             className={`px-3 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
               activeTab === 'login'
-                ? 'bg-white dark:bg-white/[0.1] text-slate-900 dark:text-white'
+                ? 'bg-blue-600 text-white'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
             }`}
           >
@@ -224,7 +231,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 value={accessToken}
                 onChange={(e) => setAccessToken(e.target.value)}
                 placeholder="Enter 10-char mixed token"
-                className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-sm font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-sm font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500"
               />
             </div>
           )}
@@ -247,7 +254,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="Enter username"
-                  className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                  className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500"
                 />
               </div>
 
@@ -269,7 +276,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder={activeTab === 'register' ? 'Minimum 6 characters' : 'Enter password'}
-                    className="w-full rounded-lg bg-slate-50 dark:bg-[#10121C] border border-slate-300 dark:border-white/[0.08] pl-3.5 pr-10 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-rose-500"
+                    className="w-full rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-300 dark:border-white/[0.08] pl-3.5 pr-10 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-blue-500"
                   />
                   <button
                     type="button"
@@ -301,7 +308,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
                 checked={activeTab === 'register' ? true : rememberMe}
                 disabled={activeTab === 'register'}
                 onChange={(e) => setRememberMe(e.target.checked)}
-                className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] bg-slate-50 dark:bg-[#10121C] text-rose-600 focus:ring-rose-500 accent-rose-600 cursor-pointer disabled:opacity-80"
+                className="w-4 h-4 rounded border-slate-300 dark:border-white/[0.2] bg-[#F3F5F8] dark:bg-[#12151C] text-blue-600 focus:ring-blue-500 accent-blue-600 cursor-pointer disabled:opacity-80"
               />
               <span className="font-medium">Remember me</span>
             </span>
@@ -324,7 +331,7 @@ export function LoginView({ onAuthenticated }: LoginViewProps) {
           <button
             type="submit"
             disabled={isSubmitting}
-            className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium bg-rose-600 hover:bg-rose-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+            className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
           >
             {isSubmitting ? (
               <Loader2 className="w-4 h-4 animate-spin shrink-0" strokeWidth={2} />

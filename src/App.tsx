@@ -1,5 +1,8 @@
+import { Search } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AnalyticsView } from './components/AnalyticsView';
 import { CheckerView, parseUrlsFromInput } from './components/CheckerView';
+import { CommandPalette } from './components/CommandPalette';
 import { ConfirmModal } from './components/ConfirmModal';
 import { HistoryView } from './components/HistoryView';
 import { LoginView } from './components/LoginView';
@@ -16,11 +19,19 @@ import type {
   ActiveView,
   AppNotification,
   AuthUser,
+  IncidentRecord,
+  IntegrationProvider,
   Organisation,
+  ProjectCheckRules,
+  ReportDispatchPayload,
   SiteCheckResult,
   SiteStatus,
   UserSettings,
 } from './types/upsite';
+import {
+  buildReportDispatchPayloadFromOrgRows,
+  exportStatusPageHtml,
+} from './utils/exporters';
 import type { SimpleOrgSiteRow } from './utils/exporters';
 import { DEFAULT_CHECK_WINDOW, isWithinCheckWindow } from './utils/intervals';
 import {
@@ -29,6 +40,27 @@ import {
 } from './utils/organisations';
 
 const SESSION_TOKEN_KEY = 'upsite_session_token';
+const SIDEBAR_WIDTH_KEY = 'upsite_sidebar_width';
+const SIDEBAR_COLLAPSED_KEY = 'upsite_sidebar_collapsed';
+const DEFAULT_TITLE = 'upsite — Website Availability & Diagnostics';
+
+function readStoredSidebarWidth(): number {
+  try {
+    const raw = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    if (Number.isFinite(raw) && raw >= 172 && raw <= 360) return raw;
+  } catch {
+    // Ignore storage errors
+  }
+  return 236;
+}
+
+function readStoredSidebarCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function readStoredSessionToken(): string | null {
   try {
@@ -65,7 +97,46 @@ const DEFAULT_SETTINGS: UserSettings = {
   density: 'comfortable',
   deepInspect: true,
   desktopNotifications: true,
+  minimizeToTray: true,
+  launchAtStartup: false,
+  integrations: [],
+  features: {
+    analyticsEnabled: true,
+    incidentTrackingEnabled: true,
+    sslExpiryAlertsEnabled: true,
+    keywordChecksEnabled: true,
+    customCheckRulesEnabled: true,
+    maintenanceWindowsEnabled: true,
+    digestReportsEnabled: false,
+    commandPaletteEnabled: true,
+  },
+  sslWarningDays: 14,
+  alertConsecutiveFailures: 1,
+  alertCooldownMin: 0,
+  digestSchedule: 'off',
 };
+
+function mergeWorkspaceSettings(incoming?: Partial<UserSettings>): UserSettings {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...(incoming || {}),
+    features: {
+      ...DEFAULT_SETTINGS.features,
+      ...(incoming?.features || {}),
+    },
+  };
+}
+
+function isOrgAlertMuted(org: Organisation, s: UserSettings, now = Date.now()): boolean {
+  if (s.features?.maintenanceWindowsEnabled === false) return false;
+  if (s.workspaceMaintenanceUntil && Date.parse(s.workspaceMaintenanceUntil) > now) {
+    return true;
+  }
+  if (org.maintenanceUntil && Date.parse(org.maintenanceUntil) > now) {
+    return true;
+  }
+  return false;
+}
 
 export default function App() {
   const [sessionToken, setSessionToken] = useState<string | null>(null);
@@ -76,6 +147,7 @@ export default function App() {
   const [urlInput, setUrlInput] = useState<string>('');
   const [latestResults, setLatestResults] = useState<SiteCheckResult[]>([]);
   const [history, setHistory] = useState<SiteCheckResult[]>([]);
+  const [incidents, setIncidents] = useState<IncidentRecord[]>([]);
   const [organisations, setOrganisations] = useState<Organisation[]>([]);
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
 
@@ -96,7 +168,46 @@ export default function App() {
   const [runningOrgScope, setRunningOrgScope] = useState<Record<string, string>>({});
   const [pendingOrgReport, setPendingOrgReport] = useState<PendingOrgReport | null>(null);
   const [confirmSignOutOpen, setConfirmSignOutOpen] = useState<boolean>(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => readStoredSidebarWidth());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() =>
+    readStoredSidebarCollapsed(),
+  );
   const skipCheckerSyncRef = useRef<boolean>(true);
+  const notificationsRef = useRef<AppNotification[]>([]);
+  const incidentsRef = useRef<IncidentRecord[]>(incidents);
+  useEffect(() => {
+    incidentsRef.current = incidents;
+  }, [incidents]);
+  const failureStreakRef = useRef<Map<string, number>>(new Map());
+  const lastAlertedAtRef = useRef<Map<string, number>>(new Map());
+  const sslWarnedCertsRef = useRef<Set<string>>(new Set());
+  const digestInFlightRef = useRef<boolean>(false);
+  const settingsRef = useRef<UserSettings>(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  const handleResizeSidebar = useCallback((nextWidth: number) => {
+    setSidebarWidth(nextWidth);
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(nextWidth));
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
+
+  const handleToggleSidebarCollapse = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? '1' : '0');
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  }, []);
 
   const authHeaders = useCallback(
     (tokenOverride?: string): Record<string, string> => {
@@ -148,10 +259,11 @@ export default function App() {
           setCurrentUser(data.user);
           if (data.workspace) {
             setHistory(data.workspace.history || []);
+            setIncidents(data.workspace.incidents || []);
             setOrganisations(
               normalizeOrganisationsProjectOrder(data.workspace.organisations || []),
             );
-            setSettings({ ...DEFAULT_SETTINGS, ...(data.workspace.settings || {}) });
+            setSettings(mergeWorkspaceSettings(data.workspace.settings));
             skipCheckerSyncRef.current = true;
             setUrlInput(data.workspace.checkerInput || '');
           }
@@ -179,10 +291,12 @@ export default function App() {
     setSessionToken(null);
     setCurrentUser(null);
     setConfirmSignOutOpen(false);
+    setCommandPaletteOpen(false);
     skipCheckerSyncRef.current = true;
     setUrlInput('');
     setLatestResults([]);
     setHistory([]);
+    setIncidents([]);
     setOrganisations([]);
     setSelectedResult(null);
     setOpenedOrgId(null);
@@ -193,6 +307,9 @@ export default function App() {
     setPendingOrgReport(null);
     setErrorMessage(null);
     setAutoRefreshRemaining(null);
+    failureStreakRef.current.clear();
+    lastAlertedAtRef.current.clear();
+    sslWarnedCertsRef.current.clear();
     setActiveView('checker');
   }, []);
 
@@ -215,15 +332,52 @@ export default function App() {
   }, [authHeaders, currentUser, isRestoringSession, urlInput]);
 
   const runCheckBatch = useCallback(
-    async (urls: string[], updateCheckerState: boolean): Promise<SiteCheckResult[]> => {
+    async (
+      urls: string[],
+      updateCheckerState: boolean,
+      rulesOverride?: ProjectCheckRules,
+    ): Promise<SiteCheckResult[]> => {
       if (!currentUser || urls.length === 0) return [];
+      const activeSettings = settingsRef.current;
+      const customRulesEnabled = activeSettings.features?.customCheckRulesEnabled !== false;
+      const keywordChecksEnabled = activeSettings.features?.keywordChecksEnabled !== false;
+
+      const filteredRules: ProjectCheckRules | undefined = rulesOverride
+        ? {
+            ...(customRulesEnabled
+              ? {
+                  method: rulesOverride.method,
+                  expectedStatuses: rulesOverride.expectedStatuses,
+                  customHeaders: rulesOverride.customHeaders,
+                }
+              : {}),
+            ...(keywordChecksEnabled
+              ? {
+                  expectedKeyword: rulesOverride.expectedKeyword,
+                  forbiddenKeyword: rulesOverride.forbiddenKeyword,
+                }
+              : {}),
+          }
+        : undefined;
+
+      const hasFilteredRules = Boolean(
+        filteredRules &&
+          (filteredRules.method ||
+            (filteredRules.expectedStatuses && filteredRules.expectedStatuses.length > 0) ||
+            (filteredRules.customHeaders && filteredRules.customHeaders.length > 0) ||
+            filteredRules.expectedKeyword ||
+            filteredRules.forbiddenKeyword),
+      );
+
       const endpoint = urls.length === 1 ? '/api/check' : '/api/check-bulk';
       const bodyPayload = {
         ...(urls.length === 1 ? { url: urls[0] } : { urls }),
         options: {
-          timeoutMs: settings.timeoutMs,
-          defaultProtocol: settings.defaultProtocol,
-          deepInspect: settings.deepInspect,
+          timeoutMs: activeSettings.timeoutMs,
+          defaultProtocol: activeSettings.defaultProtocol,
+          deepInspect: activeSettings.deepInspect,
+          sslWarningDays: activeSettings.sslWarningDays ?? 14,
+          ...(hasFilteredRules ? { rules: filteredRules } : {}),
         },
       };
 
@@ -255,7 +409,7 @@ export default function App() {
 
       if (updateCheckerState) {
         setLatestResults(items);
-        if (settings.autoInspectFirstIssue) {
+        if (activeSettings.autoInspectFirstIssue) {
           const firstIssue = items.find((item) => item.status !== 'online');
           if (firstIssue) {
             setSelectedResult(firstIssue);
@@ -265,7 +419,7 @@ export default function App() {
         } else if (items.length === 1) {
           setSelectedResult(items[0]);
         }
-      } else if (settings.autoInspectFirstIssue) {
+      } else if (activeSettings.autoInspectFirstIssue) {
         const firstIssue = items.find((item) => item.status !== 'online');
         if (firstIssue) {
           setSelectedResult(firstIssue);
@@ -274,15 +428,7 @@ export default function App() {
 
       return items;
     },
-    [
-      authHeaders,
-      currentUser,
-      handleSignOut,
-      settings.autoInspectFirstIssue,
-      settings.deepInspect,
-      settings.defaultProtocol,
-      settings.timeoutMs,
-    ],
+    [authHeaders, currentUser, handleSignOut],
   );
 
   const handleViewNotification = useCallback((notification: AppNotification) => {
@@ -290,6 +436,18 @@ export default function App() {
       prev.map((item) => (item.id === notification.id ? { ...item, read: true } : item)),
     );
     setToasts((prev) => prev.filter((item) => item.id !== notification.id));
+
+    if (notification.targetView === 'analytics') {
+      if (settingsRef.current.features?.analyticsEnabled !== false) {
+        setActiveView('analytics');
+      } else {
+        setActiveView('organisation');
+      }
+      if (notification.firstIssueResult) {
+        setSelectedResult(notification.firstIssueResult);
+      }
+      return;
+    }
 
     if (notification.targetView === 'organisation' && notification.orgId) {
       setActiveView('organisation');
@@ -309,6 +467,42 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    notificationsRef.current = notifications;
+  }, [notifications]);
+
+  // Restore window title once user returns to the app
+  useEffect(() => {
+    const resetTitle = () => {
+      if (!document.hidden) {
+        document.title = DEFAULT_TITLE;
+      }
+    };
+    window.addEventListener('focus', resetTitle);
+    document.addEventListener('visibilitychange', resetTitle);
+    return () => {
+      window.removeEventListener('focus', resetTitle);
+      document.removeEventListener('visibilitychange', resetTitle);
+    };
+  }, []);
+
+  // Handle clicks on native Electron desktop notifications
+  useEffect(() => {
+    const unsubscribe = window.upsiteDesktop?.onNotificationClick?.((notifId) => {
+      const match = notificationsRef.current.find((item) => item.id === notifId);
+      if (match) {
+        handleViewNotification(match);
+      } else {
+        setActiveView('organisation');
+      }
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [handleViewNotification]);
+
   const pushNotification = useCallback(
     (payload: Omit<AppNotification, 'id' | 'createdAt' | 'read'>) => {
       if (settings.desktopNotifications === false) return;
@@ -325,6 +519,22 @@ export default function App() {
         setToasts((prev) => prev.filter((item) => item.id !== entry.id));
       }, 14000);
 
+      if (typeof document !== 'undefined' && document.hidden) {
+        document.title = `[Alert] ${entry.title} — upsite`;
+      }
+
+      const bodyText = `${entry.message} — Click to view now.`;
+      if (typeof window !== 'undefined' && window.upsiteDesktop?.showNotification) {
+        void window.upsiteDesktop
+          .showNotification({
+            id: entry.id,
+            title: entry.title,
+            body: bodyText,
+          })
+          .catch(() => {});
+        return;
+      }
+
       if (
         typeof window !== 'undefined' &&
         'Notification' in window &&
@@ -332,7 +542,8 @@ export default function App() {
       ) {
         try {
           const nativeAlert = new window.Notification(entry.title, {
-            body: `${entry.message} — Click to view now.`,
+            body: bodyText,
+            requireInteraction: entry.downCount > 0 || (entry.newErrorCount ?? 0) > 0,
           });
           nativeAlert.onclick = () => {
             window.focus();
@@ -348,11 +559,11 @@ export default function App() {
   );
 
   const handleRunChecker = useCallback(
-    async (urls: string[]) => {
+    async (urls: string[], rules?: ProjectCheckRules) => {
       setIsChecking(true);
       setErrorMessage(null);
       try {
-        await runCheckBatch(urls, true);
+        await runCheckBatch(urls, true, rules);
       } catch (err: unknown) {
         setErrorMessage(
           err instanceof Error ? err.message : 'Unable to reach checking service.',
@@ -454,6 +665,99 @@ export default function App() {
     [authHeaders, currentUser, handleSignOut],
   );
 
+  const handleSaveIncidents = useCallback(
+    async (nextIncidents: IncidentRecord[]) => {
+      const capped = nextIncidents.slice(0, 300);
+      incidentsRef.current = capped;
+      setIncidents(capped);
+      if (!currentUser) return;
+      try {
+        const res = await fetch('/api/incidents', {
+          method: 'PUT',
+          credentials: 'include',
+          headers: authHeaders(),
+          body: JSON.stringify({ incidents: capped }),
+        });
+        if (res.status === 401) {
+          handleSignOut();
+        }
+      } catch {
+        // Keep optimistic incident timeline
+      }
+    },
+    [authHeaders, currentUser, handleSignOut],
+  );
+
+  const handleClearIncidents = useCallback(async () => {
+    incidentsRef.current = [];
+    setIncidents([]);
+    if (!currentUser) return;
+    await fetch('/api/incidents', {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: authHeaders(),
+    }).catch(() => {});
+  }, [authHeaders, currentUser]);
+
+  const handleSendReportToApps = useCallback(
+    async (
+      report: ReportDispatchPayload,
+      channelIds: string[],
+    ): Promise<{
+      sentCount: number;
+      results: Array<{ id: string; name: string; ok: boolean; error?: string }>;
+    }> => {
+      if (!currentUser || channelIds.length === 0) {
+        return { sentCount: 0, results: [] };
+      }
+      const res = await fetch('/api/integrations/send', {
+        method: 'POST',
+        credentials: 'include',
+        headers: authHeaders(),
+        body: JSON.stringify({ channelIds, report }),
+      });
+      if (res.status === 401) {
+        handleSignOut();
+        throw new Error('Session expired. Please sign in again.');
+      }
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || 'Failed to deliver report to connected apps.');
+      }
+      return {
+        sentCount: Number(data?.sentCount) || 0,
+        results: Array.isArray(data?.results) ? data.results : [],
+      };
+    },
+    [authHeaders, currentUser, handleSignOut],
+  );
+
+  const handleTestIntegration = useCallback(
+    async (channel: {
+      provider: IntegrationProvider;
+      webhookUrl: string;
+      name: string;
+    }): Promise<{ ok: boolean; error?: string }> => {
+      if (!currentUser) return { ok: false, error: 'Sign in required.' };
+      const res = await fetch('/api/integrations/test', {
+        method: 'POST',
+        credentials: 'include',
+        headers: authHeaders(),
+        body: JSON.stringify(channel),
+      });
+      if (res.status === 401) {
+        handleSignOut();
+        return { ok: false, error: 'Session expired. Please sign in again.' };
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data?.error || 'Webhook test failed.' };
+      }
+      return { ok: Boolean(data?.ok), error: data?.error };
+    },
+    [authHeaders, currentUser, handleSignOut],
+  );
+
   // Refs for background Organisation timer runs
   const organisationsRef = useRef<Organisation[]>(organisations);
   useEffect(() => {
@@ -477,10 +781,8 @@ export default function App() {
 
       const targetProjects =
         scope === 'all' ? org.projects : org.projects.filter((p) => p.id === scope);
-      const uniqueUrls = Array.from(
-        new Set(targetProjects.flatMap((p) => p.urls).filter(Boolean)),
-      );
-      if (uniqueUrls.length === 0) return;
+      const hasAnyUrls = targetProjects.some((p) => p.urls.length > 0);
+      if (!hasAnyUrls) return;
 
       const prevStatusByUrl = new Map<string, SiteStatus>();
       for (const p of org.projects) {
@@ -492,16 +794,36 @@ export default function App() {
       setRunningOrgScope((prev) => ({ ...prev, [orgId]: scope }));
 
       try {
-        const chunkResults: SiteCheckResult[] = [];
-        for (let i = 0; i < uniqueUrls.length; i += 60) {
-          const chunk = uniqueUrls.slice(i, i + 60);
-          const batch = await runCheckBatch(chunk, false);
-          chunkResults.push(...batch);
+        // Group projects by their checkRules so projects with identical rules batch cleanly
+        const groups = new Map<
+          string,
+          { rules: ProjectCheckRules | undefined; urlSet: Set<string> }
+        >();
+        for (const proj of targetProjects) {
+          const key = JSON.stringify(proj.checkRules || {});
+          const entry = groups.get(key) || { rules: proj.checkRules, urlSet: new Set<string>() };
+          for (const u of proj.urls) {
+            if (u) entry.urlSet.add(u);
+          }
+          groups.set(key, entry);
         }
 
-        const byInput = new Map<string, SiteCheckResult>();
-        for (const r of chunkResults) {
-          byInput.set(r.inputUrl, r);
+        const resultsByRuleKey = new Map<string, Map<string, SiteCheckResult>>();
+        const allExecutedResults: SiteCheckResult[] = [];
+
+        for (const [ruleKey, group] of groups.entries()) {
+          const urls = Array.from(group.urlSet);
+          if (urls.length === 0) continue;
+          const byInput = new Map<string, SiteCheckResult>();
+          for (let i = 0; i < urls.length; i += 60) {
+            const chunk = urls.slice(i, i + 60);
+            const batch = await runCheckBatch(chunk, false, group.rules);
+            for (const item of batch) {
+              byInput.set(item.inputUrl, item);
+              allExecutedResults.push(item);
+            }
+          }
+          resultsByRuleKey.set(ruleKey, byInput);
         }
 
         const checkedAt = new Date().toISOString();
@@ -512,11 +834,13 @@ export default function App() {
                 ...o,
                 projects: o.projects.map((p) => {
                   if (scope !== 'all' && p.id !== scope) return p;
+                  const key = JSON.stringify(p.checkRules || {});
+                  const mapForProj = resultsByRuleKey.get(key);
                   return {
                     ...p,
                     lastCheckedAt: checkedAt,
                     lastResults: p.urls
-                      .map((u) => byInput.get(u))
+                      .map((u) => mapForProj?.get(u))
                       .filter((item): item is SiteCheckResult => Boolean(item)),
                   };
                 }),
@@ -525,20 +849,117 @@ export default function App() {
         );
         await handleSaveOrganisations(nextOrgs);
 
-        const downResults = chunkResults.filter((r) => r.status !== 'online');
-        const onlineCount = chunkResults.length - downResults.length;
+        // Update Incident Timeline when enabled
+        const updatedOrgObj = nextOrgs.find((o) => o.id === orgId);
+        if (
+          updatedOrgObj &&
+          settingsRef.current.features?.incidentTrackingEnabled !== false
+        ) {
+          const nextIncidents = [...incidentsRef.current];
+          let incidentsChanged = false;
+          const scopedProjects =
+            scope === 'all'
+              ? updatedOrgObj.projects
+              : updatedOrgObj.projects.filter((p) => p.id === scope);
+
+          for (const proj of scopedProjects) {
+            for (const res of proj.lastResults || []) {
+              const openIdx = nextIncidents.findIndex(
+                (inc) =>
+                  inc.orgId === orgId &&
+                  inc.url === res.inputUrl &&
+                  inc.status === 'open',
+              );
+
+              if (res.status !== 'online') {
+                if (openIdx === -1) {
+                  nextIncidents.unshift({
+                    id: crypto.randomUUID(),
+                    orgId,
+                    orgName: updatedOrgObj.name,
+                    projectId: proj.id,
+                    projectName: proj.name,
+                    url: res.inputUrl,
+                    status: 'open',
+                    startedAt: res.checkedAt || checkedAt,
+                    errorCode: res.diagnosis.errorCode,
+                    reason: res.diagnosis.likelyReason,
+                  });
+                  incidentsChanged = true;
+                }
+              } else if (openIdx !== -1) {
+                const openInc = nextIncidents[openIdx];
+                const resolvedIso = res.checkedAt || checkedAt;
+                const startedMs = Date.parse(openInc.startedAt);
+                const resolvedMs = Date.parse(resolvedIso);
+                nextIncidents[openIdx] = {
+                  ...openInc,
+                  status: 'resolved',
+                  resolvedAt: resolvedIso,
+                  durationMs:
+                    Number.isFinite(startedMs) && Number.isFinite(resolvedMs)
+                      ? Math.max(0, resolvedMs - startedMs)
+                      : undefined,
+                };
+                incidentsChanged = true;
+              }
+            }
+          }
+
+          if (incidentsChanged) {
+            void handleSaveIncidents(nextIncidents);
+          }
+        }
+
+        const downResults = allExecutedResults.filter((r) => r.status !== 'online');
+        const onlineCount = allExecutedResults.length - downResults.length;
+
+        // Track consecutive failure streaks per endpoint
+        const failureThreshold = Math.max(
+          1,
+          settingsRef.current.alertConsecutiveFailures ?? 1,
+        );
+        const confirmedDownUrls = new Set<string>();
+        const newlyConfirmedDownUrls = new Set<string>();
+        for (const item of allExecutedResults) {
+          const streakKey = `${orgId}:${item.inputUrl}`;
+          if (item.status === 'online') {
+            failureStreakRef.current.set(streakKey, 0);
+          } else {
+            const nextStreak = (failureStreakRef.current.get(streakKey) || 0) + 1;
+            failureStreakRef.current.set(streakKey, nextStreak);
+            if (nextStreak >= failureThreshold) {
+              confirmedDownUrls.add(item.inputUrl);
+              if (nextStreak === failureThreshold) {
+                newlyConfirmedDownUrls.add(item.inputUrl);
+              }
+            }
+          }
+        }
+        const confirmedDownResults = downResults.filter((r) =>
+          confirmedDownUrls.has(r.inputUrl),
+        );
 
         if (source === 'timer') {
           let backOnlineCount = 0;
           let newErrorCount = 0;
-          for (const item of chunkResults) {
+          for (const item of allExecutedResults) {
             const prev = prevStatusByUrl.get(item.inputUrl);
             if ((prev === 'offline' || prev === 'error') && item.status === 'online') {
               backOnlineCount += 1;
-            } else if ((!prev || prev === 'online') && item.status !== 'online') {
+            } else if (newlyConfirmedDownUrls.has(item.inputUrl)) {
               newErrorCount += 1;
             }
           }
+
+          const muted = isOrgAlertMuted(org, settingsRef.current);
+          const cooldownMs = (settingsRef.current.alertCooldownMin ?? 0) * 60_000;
+          const lastAlertTs = lastAlertedAtRef.current.get(orgId) || 0;
+          const inCooldown =
+            cooldownMs > 0 &&
+            confirmedDownResults.length > 0 &&
+            backOnlineCount === 0 &&
+            Date.now() - lastAlertTs < cooldownMs;
 
           const changeParts: string[] = [];
           if (backOnlineCount > 0) {
@@ -554,41 +975,115 @@ export default function App() {
           const changeMessage =
             changeParts.length > 0
               ? changeParts.join(', ')
-              : `No status changes (${onlineCount} online, ${downResults.length} down)`;
+              : `No status changes (${onlineCount} online, ${confirmedDownResults.length} down)`;
 
-          pushNotification({
-            kind: 'org-changes',
-            title: `${org.name} · Scheduled Check`,
-            message: changeMessage,
-            targetView: 'organisation',
-            orgId: org.id,
-            downCount: downResults.length,
-            backOnlineCount,
-            newErrorCount,
-            firstIssueResult: downResults[0],
-          });
+          if (!muted && !inCooldown && (downResults.length === 0 || confirmedDownResults.length > 0 || backOnlineCount > 0)) {
+            if (confirmedDownResults.length > 0) {
+              lastAlertedAtRef.current.set(orgId, Date.now());
+            }
 
-          pushNotification({
-            kind: 'results-ready',
-            title: 'Site results are ready',
-            message:
-              downResults.length > 0
-                ? `${org.name}: ${downResults.length} ${downResults.length === 1 ? 'site' : 'sites'} down`
-                : `${org.name}: All ${onlineCount} ${onlineCount === 1 ? 'site' : 'sites'} online`,
-            targetView: 'organisation',
-            orgId: org.id,
-            downCount: downResults.length,
-            firstIssueResult: downResults[0],
-          });
+            pushNotification({
+              kind: 'org-changes',
+              title: `${org.name} · Scheduled Check`,
+              message: changeMessage,
+              targetView: 'organisation',
+              orgId: org.id,
+              downCount: confirmedDownResults.length,
+              backOnlineCount,
+              newErrorCount,
+              firstIssueResult: confirmedDownResults[0],
+            });
+
+            pushNotification({
+              kind: 'results-ready',
+              title: 'Site results are ready',
+              message:
+                confirmedDownResults.length > 0
+                  ? `${org.name}: ${confirmedDownResults.length} ${confirmedDownResults.length === 1 ? 'site' : 'sites'} down`
+                  : `${org.name}: All ${onlineCount} ${onlineCount === 1 ? 'site' : 'sites'} online`,
+              targetView: 'organisation',
+              orgId: org.id,
+              downCount: confirmedDownResults.length,
+              firstIssueResult: confirmedDownResults[0],
+            });
+
+            const autoChannels = (settingsRef.current.integrations || []).filter(
+              (c) =>
+                c.enabled &&
+                c.autoSendOnOrgRun &&
+                (!c.onlyOnIssues || confirmedDownResults.length > 0),
+            );
+            if (updatedOrgObj && autoChannels.length > 0) {
+              const autoRows: SimpleOrgSiteRow[] = [];
+              for (const proj of sortProjectsByName(updatedOrgObj.projects)) {
+                for (const res of proj.lastResults || []) {
+                  autoRows.push({ projectName: proj.name, result: res });
+                }
+              }
+              if (autoRows.length > 0) {
+                const autoPayload = buildReportDispatchPayloadFromOrgRows(
+                  updatedOrgObj.name,
+                  autoRows,
+                  changeMessage,
+                );
+                void handleSendReportToApps(
+                  autoPayload,
+                  autoChannels.map((c) => c.id),
+                ).catch(() => {});
+              }
+            }
+          }
+
+          // Proactive SSL Expiry Alerts
+          if (
+            !muted &&
+            settingsRef.current.features?.sslExpiryAlertsEnabled !== false
+          ) {
+            const warnDays = settingsRef.current.sslWarningDays ?? 14;
+            const expiringItems = allExecutedResults.filter(
+              (item) =>
+                item.ssl.checked &&
+                item.ssl.valid &&
+                typeof item.ssl.daysRemaining === 'number' &&
+                item.ssl.daysRemaining <= warnDays,
+            );
+            const unseenExpiring = expiringItems.filter((item) => {
+              const key = `${item.normalizedUrl}:${item.ssl.validTo || item.ssl.daysRemaining}`;
+              return !sslWarnedCertsRef.current.has(key);
+            });
+            if (unseenExpiring.length > 0) {
+              for (const item of unseenExpiring) {
+                const key = `${item.normalizedUrl}:${item.ssl.validTo || item.ssl.daysRemaining}`;
+                sslWarnedCertsRef.current.add(key);
+              }
+              const soonest = [...unseenExpiring].sort(
+                (a, b) => (a.ssl.daysRemaining ?? 999) - (b.ssl.daysRemaining ?? 999),
+              )[0];
+              pushNotification({
+                kind: 'ssl-expiry',
+                title: `SSL Certificate Expiring Soon`,
+                message:
+                  unseenExpiring.length === 1
+                    ? `${soonest.normalizedUrl} expires in ${soonest.ssl.daysRemaining}d`
+                    : `${unseenExpiring.length} certificates expire within ${warnDays} days (soonest: ${soonest.ssl.daysRemaining}d)`,
+                targetView: 'analytics',
+                orgId: org.id,
+                downCount: 0,
+                firstIssueResult: soonest,
+              });
+            }
+          }
         }
 
-        const updatedOrg = nextOrgs.find((o) => o.id === orgId);
-        if (updatedOrg && (source === 'manual' || activeViewRef.current === 'organisation')) {
+        if (
+          updatedOrgObj &&
+          (source === 'manual' || activeViewRef.current === 'organisation')
+        ) {
           const reportRows: SimpleOrgSiteRow[] = [];
           const scopedProjects = sortProjectsByName(
             scope === 'all'
-              ? updatedOrg.projects
-              : updatedOrg.projects.filter((p) => p.id === scope),
+              ? updatedOrgObj.projects
+              : updatedOrgObj.projects.filter((p) => p.id === scope),
           );
           for (const proj of scopedProjects) {
             for (const res of proj.lastResults || []) {
@@ -596,9 +1091,11 @@ export default function App() {
             }
           }
           if (reportRows.length > 0) {
-            const reportOnline = reportRows.filter((r) => r.result.status === 'online').length;
+            const reportOnline = reportRows.filter(
+              (r) => r.result.status === 'online',
+            ).length;
             setPendingOrgReport({
-              orgName: updatedOrg.name,
+              orgName: updatedOrgObj.name,
               scopeLabel:
                 scope === 'all'
                   ? `All projects (${scopedProjects.length})`
@@ -617,7 +1114,13 @@ export default function App() {
         });
       }
     },
-    [handleSaveOrganisations, pushNotification, runCheckBatch],
+    [
+      handleSaveIncidents,
+      handleSaveOrganisations,
+      handleSendReportToApps,
+      pushNotification,
+      runCheckBatch,
+    ],
   );
 
   const executeOrgRunRef = useRef(executeOrgRun);
@@ -691,34 +1194,219 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [currentUser, scheduleFingerprint]);
 
-  const handleUpdateSettings = async (partial: Partial<UserSettings>) => {
-    const optimistic = { ...settings, ...partial };
-    setSettings(optimistic);
-    if (!currentUser) return;
+  // Sync Desktop System Tray settings, status summary, and tray Run command
+  useEffect(() => {
+    void window.upsiteDesktop?.setTraySettings?.({
+      minimizeToTray: currentUser ? settings.minimizeToTray !== false : false,
+    });
+  }, [currentUser, settings.minimizeToTray]);
 
-    setIsSavingSettings(true);
-    setSettingsSavedNotice(false);
-    try {
-      const res = await fetch('/api/settings', {
-        method: 'PUT',
-        credentials: 'include',
-        headers: authHeaders(),
-        body: JSON.stringify({ settings: partial }),
+  useEffect(() => {
+    if (!currentUser) {
+      void window.upsiteDesktop?.updateTrayStatus?.({
+        summary: 'Signed out',
+        downCount: 0,
       });
-      if (res.status === 401) {
-        handleSignOut();
-        return;
-      }
-      if (res.ok) {
-        const data = await res.json();
-        if (data.settings) setSettings(data.settings);
-        setSettingsSavedNotice(true);
-        setTimeout(() => setSettingsSavedNotice(false), 1800);
-      }
-    } finally {
-      setIsSavingSettings(false);
+      return;
     }
-  };
+
+    let orgOnline = 0;
+    let orgDown = 0;
+    for (const org of organisations) {
+      for (const proj of org.projects) {
+        for (const res of proj.lastResults || []) {
+          if (res.status === 'online') orgOnline += 1;
+          else orgDown += 1;
+        }
+      }
+    }
+
+    const totalTracked = orgOnline + orgDown;
+    const summary =
+      totalTracked > 0
+        ? orgDown > 0
+          ? `${orgDown} down · ${orgOnline} online`
+          : `All ${orgOnline} monitored sites online`
+        : `${organisations.length} ${organisations.length === 1 ? 'organisation' : 'organisations'} ready`;
+
+    void window.upsiteDesktop?.updateTrayStatus?.({
+      summary,
+      downCount: orgDown,
+    });
+  }, [currentUser, organisations]);
+
+  useEffect(() => {
+    const unsubscribe = window.upsiteDesktop?.onTrayRunOrg?.(() => {
+      const orgs = organisationsRef.current.filter((o) =>
+        o.projects.some((p) => p.urls.length > 0),
+      );
+      for (const org of orgs) {
+        void executeOrgRunRef.current(org.id, 'all', 'manual');
+      }
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, []);
+
+  const handleUpdateSettings = useCallback(
+    async (partial: Partial<UserSettings>) => {
+      const optimistic: UserSettings = {
+        ...settingsRef.current,
+        ...partial,
+        features: {
+          ...settingsRef.current.features,
+          ...(partial.features || {}),
+        },
+      };
+      setSettings(optimistic);
+      if (!currentUser) return;
+
+      setIsSavingSettings(true);
+      setSettingsSavedNotice(false);
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'PUT',
+          credentials: 'include',
+          headers: authHeaders(),
+          body: JSON.stringify({ settings: partial }),
+        });
+        if (res.status === 401) {
+          handleSignOut();
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          if (data.settings) setSettings(mergeWorkspaceSettings(data.settings));
+          setSettingsSavedNotice(true);
+          setTimeout(() => setSettingsSavedNotice(false), 1800);
+        }
+      } finally {
+        setIsSavingSettings(false);
+      }
+    },
+    [authHeaders, currentUser, handleSignOut],
+  );
+
+  // Sync Windows Launch-at-Startup preference with Electron desktop shell
+  useEffect(() => {
+    void window.upsiteDesktop?.setLaunchAtStartup?.(Boolean(settings.launchAtStartup));
+  }, [settings.launchAtStartup]);
+
+  // Redirect off Analytics if user disables the Analytics module in Settings
+  useEffect(() => {
+    if (settings.features?.analyticsEnabled === false && activeView === 'analytics') {
+      setActiveView('checker');
+    }
+  }, [activeView, settings.features?.analyticsEnabled]);
+
+  // Global Quick Command Search shortcut (Ctrl+K / Cmd+K)
+  useEffect(() => {
+    if (!currentUser || settings.features?.commandPaletteEnabled === false) {
+      setCommandPaletteOpen(false);
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCommandPaletteOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [currentUser, settings.features?.commandPaletteEnabled]);
+
+  // Scheduled Digest Reports (manual & daily/weekly automated trigger)
+  const handleSendDigestNow = useCallback(async (): Promise<{
+    ok: boolean;
+    message: string;
+  }> => {
+    const enabledChannels = (settingsRef.current.integrations || []).filter((c) => c.enabled);
+    if (enabledChannels.length === 0) {
+      return {
+        ok: false,
+        message: 'Enable at least one Connected App channel above first.',
+      };
+    }
+
+    const digestRows: SimpleOrgSiteRow[] = [];
+    for (const org of organisationsRef.current) {
+      for (const proj of sortProjectsByName(org.projects)) {
+        for (const res of proj.lastResults || []) {
+          digestRows.push({ projectName: `${org.name} / ${proj.name}`, result: res });
+        }
+      }
+    }
+
+    if (digestRows.length === 0) {
+      return {
+        ok: false,
+        message: 'Run at least one Organisation check first so the digest has live results.',
+      };
+    }
+
+    const openIncidents = incidentsRef.current.filter((i) => i.status === 'open').length;
+    const summaryLabel = `${organisationsRef.current.length} orgs · ${digestRows.length} sites · ${openIncidents} open ${openIncidents === 1 ? 'incident' : 'incidents'}`;
+    const payload = buildReportDispatchPayloadFromOrgRows(
+      'upsite Scheduled Digest',
+      digestRows,
+      summaryLabel,
+    );
+
+    const res = await handleSendReportToApps(
+      payload,
+      enabledChannels.map((c) => c.id),
+    );
+    if (res.sentCount > 0) {
+      await handleUpdateSettings({ lastDigestSentAt: new Date().toISOString() });
+      return {
+        ok: true,
+        message: `Digest delivered to ${res.sentCount} ${res.sentCount === 1 ? 'app' : 'apps'}.`,
+      };
+    }
+    const firstErr = res.results.find((r) => !r.ok)?.error;
+    return {
+      ok: false,
+      message: firstErr || 'No connected channels accepted the digest.',
+    };
+  }, [handleSendReportToApps, handleUpdateSettings]);
+
+  useEffect(() => {
+    if (
+      !currentUser ||
+      !settings.features?.digestReportsEnabled ||
+      settings.digestSchedule === 'off'
+    ) {
+      return;
+    }
+
+    const periodMs =
+      settings.digestSchedule === 'weekly' ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+
+    const checkAndSend = () => {
+      if (digestInFlightRef.current) return;
+      const lastTs = settingsRef.current.lastDigestSentAt
+        ? Date.parse(settingsRef.current.lastDigestSentAt)
+        : 0;
+      if (lastTs && Date.now() - lastTs < periodMs) return;
+      digestInFlightRef.current = true;
+      void handleSendDigestNow()
+        .catch(() => {})
+        .finally(() => {
+          digestInFlightRef.current = false;
+        });
+    };
+
+    const timer = window.setInterval(checkAndSend, 60_000);
+    return () => window.clearInterval(timer);
+  }, [
+    currentUser,
+    handleSendDigestNow,
+    settings.digestSchedule,
+    settings.features?.digestReportsEnabled,
+  ]);
 
   const handleClearResults = () => {
     setLatestResults([]);
@@ -739,9 +1427,42 @@ export default function App() {
     }).catch(() => {});
   };
 
+  const handleDeduplicateHistory = async () => {
+    setHistory((prev) => {
+      const seen = new Set<string>();
+      const ordered = [...prev].sort(
+        (a, b) => (Date.parse(b.checkedAt) || 0) - (Date.parse(a.checkedAt) || 0),
+      );
+      const deduped: SiteCheckResult[] = [];
+      for (const item of ordered) {
+        const key = (item.normalizedUrl || item.inputUrl).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(item);
+      }
+      return deduped;
+    });
+    if (!currentUser) return;
+    try {
+      const res = await fetch('/api/history/deduplicate', {
+        method: 'POST',
+        credentials: 'include',
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data?.history)) {
+          setHistory(data.history);
+        }
+      }
+    } catch {
+      // Optimistic state already updated
+    }
+  };
+
   if (isRestoringSession) {
     return (
-      <div className="min-h-screen w-full bg-slate-100 dark:bg-[#0F111A] text-slate-600 dark:text-slate-400 flex items-center justify-center p-6">
+      <div className="min-h-screen w-full bg-[#F3F5F8] dark:bg-[#111318] text-slate-600 dark:text-slate-400 flex items-center justify-center p-6">
         <span className="text-xs font-medium tracking-wide">Restoring session...</span>
       </div>
     );
@@ -760,10 +1481,11 @@ export default function App() {
           setCurrentUser(payload.user);
           if (payload.workspace) {
             setHistory(payload.workspace.history || []);
+            setIncidents(payload.workspace.incidents || []);
             setOrganisations(
               normalizeOrganisationsProjectOrder(payload.workspace.organisations || []),
             );
-            setSettings({ ...DEFAULT_SETTINGS, ...(payload.workspace.settings || {}) });
+            setSettings(mergeWorkspaceSettings(payload.workspace.settings));
             skipCheckerSyncRef.current = true;
             setUrlInput(payload.workspace.checkerInput || '');
           }
@@ -772,6 +1494,13 @@ export default function App() {
     );
   }
 
+  const showAnalytics = settings.features?.analyticsEnabled !== false;
+  const showCommandPalette = settings.features?.commandPaletteEnabled !== false;
+  const openIncidentCount =
+    settings.features?.incidentTrackingEnabled !== false
+      ? incidents.filter((inc) => inc.status === 'open').length
+      : 0;
+
   const pageTitle =
     activeView === 'checker'
       ? 'Website Checker'
@@ -779,7 +1508,9 @@ export default function App() {
         ? 'Organisation Projects'
         : activeView === 'history'
           ? 'Check History'
-          : 'Settings';
+          : activeView === 'analytics'
+            ? 'Uptime & Latency Analytics'
+            : 'Settings';
 
   const pageSubtitle =
     activeView === 'checker'
@@ -787,11 +1518,33 @@ export default function App() {
       : activeView === 'organisation'
         ? 'Manage company organisations, multi-URL project records, and batch runs'
         : activeView === 'history'
-          ? 'Review past website checks, status codes, and export reports'
-          : 'Configure light/dark appearance and availability checking behavior';
+          ? 'Review past website checks, outage incidents, and export reports'
+          : activeView === 'analytics'
+            ? 'Track uptime percentages, latency trends, expiring SSL certificates, and export a public status page'
+            : 'Configure appearance, alert thresholds, optional features, and connected apps';
+
+  const handleExportWorkspaceStatusPage = () => {
+    const hasOrgResults = organisations.some((o) =>
+      o.projects.some((p) => (p.lastResults || []).length > 0),
+    );
+    const fallbackResults =
+      !hasOrgResults
+        ? latestResults.length > 0
+          ? latestResults
+          : history.slice(0, 50)
+        : undefined;
+    exportStatusPageHtml({
+      title: `${currentUser.username} — Service Status`,
+      subtitle: `${organisations.length} organisations · Live availability & incident summary`,
+      organisations,
+      results: fallbackResults,
+      incidents:
+        settings.features?.incidentTrackingEnabled !== false ? incidents.slice(0, 20) : [],
+    });
+  };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-slate-100 dark:bg-[#0F111A] text-slate-900 dark:text-slate-100 flex flex-col md:flex-row">
+    <div className="h-screen w-full overflow-hidden bg-[#F3F5F8] dark:bg-[#111318] text-slate-900 dark:text-slate-100 flex flex-col md:flex-row">
       {/* Left Navigation Sidebar */}
       <Sidebar
         activeView={activeView}
@@ -805,16 +1558,22 @@ export default function App() {
         latestResults={latestResults}
         historyCount={history.length}
         organisationCount={organisations.length}
+        openIncidentCount={openIncidentCount}
+        showAnalytics={showAnalytics}
         user={currentUser}
         onSignOut={() => setConfirmSignOutOpen(true)}
+        width={sidebarWidth}
+        collapsed={sidebarCollapsed}
+        onResizeWidth={handleResizeSidebar}
+        onToggleCollapse={handleToggleSidebarCollapse}
       />
 
       {/* Main Desktop Frame */}
-      <div className="flex-1 flex flex-col min-w-0 h-full bg-slate-50 dark:bg-[#121420]">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-[#F8FAFC] dark:bg-[#14171F]">
         {/* Top Bar */}
-        <header className="h-16 px-6 lg:px-8 border-b border-slate-200 dark:border-white/[0.06] flex items-center justify-between gap-6 shrink-0">
+        <header className="h-14 px-4 sm:px-6 lg:px-8 border-b border-slate-200/90 dark:border-white/[0.06] bg-white/80 dark:bg-[#161920]/70 backdrop-blur-md flex items-center justify-between gap-4 shrink-0">
           <div className="min-w-0">
-            <h1 className="text-base font-semibold text-slate-900 dark:text-slate-100 truncate">
+            <h1 className="text-sm sm:text-base font-semibold text-slate-900 dark:text-slate-100 truncate">
               {pageTitle}
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400 truncate hidden sm:block">
@@ -822,21 +1581,38 @@ export default function App() {
             </p>
           </div>
 
-          <NotificationBellButton
-            notifications={notifications}
-            onViewNotification={handleViewNotification}
-            onMarkAllRead={() =>
-              setNotifications((prev) => prev.map((n) => ({ ...n, read: true })))
-            }
-            onClearAll={() => {
-              setNotifications([]);
-              setToasts([]);
-            }}
-          />
+          <div className="flex items-center gap-2 shrink-0">
+            {showCommandPalette && (
+              <button
+                type="button"
+                onClick={() => setCommandPaletteOpen(true)}
+                aria-label="Quick command search (Ctrl+K)"
+                className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-600 dark:text-slate-300 bg-[#F3F5F8] dark:bg-white/[0.05] hover:bg-slate-200/80 dark:hover:bg-white/[0.1] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Search className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Search</span>
+                <kbd className="hidden md:inline-block text-[10px] font-mono text-slate-400 dark:text-slate-500 px-1 rounded bg-white/80 dark:bg-black/30 border border-slate-200 dark:border-white/[0.08]">
+                  Ctrl+K
+                </kbd>
+              </button>
+            )}
+
+            <NotificationBellButton
+              notifications={notifications}
+              onViewNotification={handleViewNotification}
+              onMarkAllRead={() =>
+                setNotifications((prev) => prev.map((n) => ({ ...n, read: true })))
+              }
+              onClearAll={() => {
+                setNotifications([]);
+                setToasts([]);
+              }}
+            />
+          </div>
         </header>
 
         {/* Content + Optional Secondary Details Inspector */}
-        <main className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+        <main className="relative flex-1 flex flex-row min-h-0 min-w-0 overflow-hidden">
           {activeView === 'checker' && (
             <CheckerView
               urlInput={urlInput}
@@ -848,10 +1624,13 @@ export default function App() {
               errorMessage={errorMessage}
               settings={settings}
               autoRefreshRemaining={autoRefreshRemaining}
+              integrations={settings.integrations || []}
               onChangeStatusFilter={setCheckerStatusFilter}
               onRunCheck={handleRunChecker}
               onSelectResult={(item) => setSelectedResult(item)}
               onClearResults={handleClearResults}
+              onSendToApps={handleSendReportToApps}
+              onOpenIntegrationsSettings={() => setActiveView('settings')}
             />
           )}
 
@@ -865,6 +1644,7 @@ export default function App() {
               orgNextRunAt={orgNextRunAt}
               runningOrgScope={runningOrgScope}
               pendingReport={pendingOrgReport}
+              integrations={settings.integrations || []}
               onChangeOpenedOrgId={setOpenedOrgId}
               onChangeStatusFilter={setOrgStatusFilter}
               onSaveOrganisations={handleSaveOrganisations}
@@ -872,16 +1652,42 @@ export default function App() {
               onRunOrgProject={(orgId, projectId) => executeOrgRun(orgId, projectId, 'manual')}
               onSelectResult={(item) => setSelectedResult(item)}
               onDismissPendingReport={() => setPendingOrgReport(null)}
+              onSendToApps={handleSendReportToApps}
+              onOpenIntegrationsSettings={() => setActiveView('settings')}
             />
           )}
 
           {activeView === 'history' && (
             <HistoryView
               history={history}
+              incidents={incidents}
               selectedId={selectedResult?.id ?? null}
               settings={settings}
+              integrations={settings.integrations || []}
               onSelectResult={(item) => setSelectedResult(item)}
               onClearHistory={handleClearHistory}
+              onClearIncidents={handleClearIncidents}
+              onDeduplicateHistory={handleDeduplicateHistory}
+              onSendToApps={handleSendReportToApps}
+              onOpenIntegrationsSettings={() => setActiveView('settings')}
+            />
+          )}
+
+          {activeView === 'analytics' && showAnalytics && (
+            <AnalyticsView
+              history={history}
+              organisations={organisations}
+              incidents={incidents}
+              settings={settings}
+              integrations={settings.integrations || []}
+              onSelectResult={(item) => setSelectedResult(item)}
+              onOpenOrganisation={(orgId) => {
+                setActiveView('organisation');
+                setOpenedOrgId(orgId);
+              }}
+              onOpenIncidentsTab={() => setActiveView('history')}
+              onSendToApps={handleSendReportToApps}
+              onOpenIntegrationsSettings={() => setActiveView('settings')}
             />
           )}
 
@@ -892,6 +1698,9 @@ export default function App() {
               isSaving={isSavingSettings}
               savedNotice={settingsSavedNotice}
               onUpdateSettings={handleUpdateSettings}
+              onTestIntegration={handleTestIntegration}
+              onSendDigestNow={handleSendDigestNow}
+              onOpenCommandPalette={() => setCommandPaletteOpen(true)}
             />
           )}
 
@@ -911,6 +1720,40 @@ export default function App() {
         onDismiss={(id) => setToasts((prev) => prev.filter((item) => item.id !== id))}
         onViewNow={handleViewNotification}
       />
+
+      {showCommandPalette && (
+        <CommandPalette
+          open={commandPaletteOpen}
+          organisations={organisations}
+          history={history}
+          showAnalytics={showAnalytics}
+          theme={settings.theme}
+          onClose={() => setCommandPaletteOpen(false)}
+          onNavigateView={(view) => {
+            if (view === 'organisation') setOpenedOrgId(null);
+            setActiveView(view);
+          }}
+          onOpenOrganisation={(orgId) => {
+            setActiveView('organisation');
+            setOpenedOrgId(orgId);
+          }}
+          onInspectResult={(result) => setSelectedResult(result)}
+          onRunAllOrganisations={() => {
+            const orgs = organisationsRef.current.filter((o) =>
+              o.projects.some((p) => p.urls.length > 0),
+            );
+            for (const org of orgs) {
+              void executeOrgRun(org.id, 'all', 'manual');
+            }
+          }}
+          onToggleTheme={() =>
+            void handleUpdateSettings({
+              theme: settings.theme === 'dark' ? 'light' : 'dark',
+            })
+          }
+          onExportStatusPage={handleExportWorkspaceStatusPage}
+        />
+      )}
 
       <ConfirmModal
         open={confirmSignOutOpen}

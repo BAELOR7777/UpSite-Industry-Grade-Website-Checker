@@ -5,6 +5,10 @@ import type {
   AuthUser,
   CheckTimeWindow,
   DayOfWeek,
+  FeaturePreferences,
+  IncidentRecord,
+  IntegrationChannel,
+  IntegrationProvider,
   Organisation,
   SiteCheckResult,
   UserSettings,
@@ -43,6 +47,78 @@ export function sanitizeCheckWindow(input: unknown): CheckTimeWindow {
   };
 }
 
+const VALID_PROVIDERS = new Set<IntegrationProvider>(['teams', 'slack', 'discord', 'webhook']);
+
+export function sanitizeIntegrations(input: unknown): IntegrationChannel[] {
+  if (!Array.isArray(input)) return [];
+  const clean: IntegrationChannel[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Partial<IntegrationChannel>;
+    const rawUrl = typeof obj.webhookUrl === 'string' ? obj.webhookUrl.trim() : '';
+    if (!rawUrl || rawUrl.length > 2048) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== 'https:') continue;
+
+    const provider: IntegrationProvider =
+      obj.provider && VALID_PROVIDERS.has(obj.provider) ? obj.provider : 'webhook';
+    const rawName = typeof obj.name === 'string' ? obj.name.trim().slice(0, 60) : '';
+
+    clean.push({
+      id: typeof obj.id === 'string' && obj.id ? obj.id.slice(0, 64) : crypto.randomUUID(),
+      name:
+        rawName ||
+        (provider === 'teams'
+          ? 'Microsoft Teams'
+          : provider === 'slack'
+            ? 'Slack'
+            : provider === 'discord'
+              ? 'Discord'
+              : 'Custom Webhook'),
+      provider,
+      webhookUrl: parsed.toString(),
+      enabled: obj.enabled !== false,
+      autoSendOnOrgRun: Boolean(obj.autoSendOnOrgRun),
+      onlyOnIssues: Boolean(obj.onlyOnIssues),
+    });
+    if (clean.length >= 20) break;
+  }
+  return clean;
+}
+
+export const DEFAULT_FEATURES: FeaturePreferences = {
+  analyticsEnabled: true,
+  incidentTrackingEnabled: true,
+  sslExpiryAlertsEnabled: true,
+  keywordChecksEnabled: true,
+  customCheckRulesEnabled: true,
+  maintenanceWindowsEnabled: true,
+  digestReportsEnabled: false,
+  commandPaletteEnabled: true,
+};
+
+export function sanitizeFeatures(input: unknown): FeaturePreferences {
+  if (!input || typeof input !== 'object') {
+    return { ...DEFAULT_FEATURES };
+  }
+  const obj = input as Partial<FeaturePreferences>;
+  return {
+    analyticsEnabled: obj.analyticsEnabled !== false,
+    incidentTrackingEnabled: obj.incidentTrackingEnabled !== false,
+    sslExpiryAlertsEnabled: obj.sslExpiryAlertsEnabled !== false,
+    keywordChecksEnabled: obj.keywordChecksEnabled !== false,
+    customCheckRulesEnabled: obj.customCheckRulesEnabled !== false,
+    maintenanceWindowsEnabled: obj.maintenanceWindowsEnabled !== false,
+    digestReportsEnabled: Boolean(obj.digestReportsEnabled),
+    commandPaletteEnabled: obj.commandPaletteEnabled !== false,
+  };
+}
+
 export const DEFAULT_SETTINGS: UserSettings = {
   theme: 'dark',
   timeoutMs: 8500,
@@ -54,6 +130,14 @@ export const DEFAULT_SETTINGS: UserSettings = {
   density: 'comfortable',
   deepInspect: true,
   desktopNotifications: true,
+  minimizeToTray: true,
+  launchAtStartup: false,
+  integrations: [],
+  features: { ...DEFAULT_FEATURES },
+  sslWarningDays: 14,
+  alertConsecutiveFailures: 1,
+  alertCooldownMin: 0,
+  digestSchedule: 'off',
 };
 
 interface StoredUser {
@@ -69,6 +153,7 @@ interface StoredUser {
 interface UserWorkspace {
   history: SiteCheckResult[];
   organisations: Organisation[];
+  incidents?: IncidentRecord[];
   settings: UserSettings;
   checkerInput?: string;
 }
@@ -226,17 +311,23 @@ function ensureWorkspace(db: UpsiteDatabase, userId: string): UserWorkspace {
     db.workspaces[userId] = {
       history: [],
       organisations: [],
-      settings: { ...DEFAULT_SETTINGS },
+      incidents: [],
+      settings: { ...DEFAULT_SETTINGS, features: { ...DEFAULT_FEATURES } },
       checkerInput: '',
     };
   }
+  const existing = db.workspaces[userId];
   return {
-    history: db.workspaces[userId].history || [],
-    organisations: normalizeOrganisationsProjectOrder(db.workspaces[userId].organisations || []),
-    settings: { ...DEFAULT_SETTINGS, ...(db.workspaces[userId].settings || {}) },
-    checkerInput: typeof db.workspaces[userId].checkerInput === 'string'
-      ? db.workspaces[userId].checkerInput
-      : '',
+    history: existing.history || [],
+    organisations: normalizeOrganisationsProjectOrder(existing.organisations || []),
+    incidents: Array.isArray(existing.incidents) ? existing.incidents.slice(0, 300) : [],
+    settings: {
+      ...DEFAULT_SETTINGS,
+      ...(existing.settings || {}),
+      integrations: sanitizeIntegrations(existing.settings?.integrations),
+      features: sanitizeFeatures(existing.settings?.features),
+    },
+    checkerInput: typeof existing.checkerInput === 'string' ? existing.checkerInput : '',
   };
 }
 
@@ -421,6 +512,25 @@ export function clearUserHistory(userId: string): void {
   saveDb(db);
 }
 
+export function deduplicateUserHistory(userId: string): SiteCheckResult[] {
+  const db = loadDb();
+  const ws = ensureWorkspace(db, userId);
+  const seen = new Set<string>();
+  const ordered = [...ws.history].sort(
+    (a, b) => (Date.parse(b.checkedAt) || 0) - (Date.parse(a.checkedAt) || 0),
+  );
+  const deduped: SiteCheckResult[] = [];
+  for (const item of ordered) {
+    const key = (item.normalizedUrl || item.inputUrl).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  db.workspaces[userId] = { ...ws, history: deduped };
+  saveDb(db);
+  return deduped;
+}
+
 export function saveUserOrganisations(userId: string, organisations: Organisation[]): Organisation[] {
   const db = loadDb();
   const ws = ensureWorkspace(db, userId);
@@ -437,6 +547,38 @@ export function saveUserCheckerInput(userId: string, checkerInput: string): stri
   db.workspaces[userId] = { ...ws, checkerInput: cleaned };
   saveDb(db);
   return cleaned;
+}
+
+export function saveUserIncidents(userId: string, incidents: IncidentRecord[]): IncidentRecord[] {
+  const db = loadDb();
+  const ws = ensureWorkspace(db, userId);
+  const clean = incidents
+    .filter((item): item is IncidentRecord => Boolean(item && typeof item === 'object' && item.url))
+    .slice(0, 300)
+    .map((item) => ({
+      id: typeof item.id === 'string' && item.id ? item.id.slice(0, 64) : crypto.randomUUID(),
+      orgId: String(item.orgId || '').slice(0, 64),
+      orgName: String(item.orgName || '').slice(0, 80),
+      projectId: typeof item.projectId === 'string' ? item.projectId.slice(0, 64) : undefined,
+      projectName: typeof item.projectName === 'string' ? item.projectName.slice(0, 80) : undefined,
+      url: String(item.url).slice(0, 2048),
+      status: item.status === 'resolved' ? ('resolved' as const) : ('open' as const),
+      startedAt: typeof item.startedAt === 'string' ? item.startedAt : new Date().toISOString(),
+      resolvedAt: typeof item.resolvedAt === 'string' ? item.resolvedAt : undefined,
+      durationMs: typeof item.durationMs === 'number' && Number.isFinite(item.durationMs) ? Math.max(0, item.durationMs) : undefined,
+      errorCode: String(item.errorCode || 'UNKNOWN').slice(0, 60),
+      reason: String(item.reason || '').slice(0, 300),
+    }));
+  db.workspaces[userId] = { ...ws, incidents: clean };
+  saveDb(db);
+  return clean;
+}
+
+export function clearUserIncidents(userId: string): void {
+  const db = loadDb();
+  const ws = ensureWorkspace(db, userId);
+  db.workspaces[userId] = { ...ws, incidents: [] };
+  saveDb(db);
 }
 
 export function updateUserSettings(
@@ -491,6 +633,60 @@ export function updateUserSettings(
   }
   if (typeof partial.desktopNotifications === 'boolean') {
     next.desktopNotifications = partial.desktopNotifications;
+  }
+  if (typeof partial.minimizeToTray === 'boolean') {
+    next.minimizeToTray = partial.minimizeToTray;
+  }
+  if (typeof partial.launchAtStartup === 'boolean') {
+    next.launchAtStartup = partial.launchAtStartup;
+  }
+  if (Array.isArray(partial.integrations)) {
+    next.integrations = sanitizeIntegrations(partial.integrations);
+  } else {
+    next.integrations = sanitizeIntegrations(next.integrations);
+  }
+  if (partial.features && typeof partial.features === 'object') {
+    next.features = sanitizeFeatures({ ...next.features, ...partial.features });
+  } else {
+    next.features = sanitizeFeatures(next.features);
+  }
+  if (partial.sslWarningDays === 7 || partial.sslWarningDays === 14 || partial.sslWarningDays === 30) {
+    next.sslWarningDays = partial.sslWarningDays;
+  }
+  if (
+    partial.alertConsecutiveFailures === 1 ||
+    partial.alertConsecutiveFailures === 2 ||
+    partial.alertConsecutiveFailures === 3
+  ) {
+    next.alertConsecutiveFailures = partial.alertConsecutiveFailures;
+  }
+  if (
+    partial.alertCooldownMin === 0 ||
+    partial.alertCooldownMin === 5 ||
+    partial.alertCooldownMin === 15 ||
+    partial.alertCooldownMin === 30 ||
+    partial.alertCooldownMin === 60
+  ) {
+    next.alertCooldownMin = partial.alertCooldownMin;
+  }
+  if (
+    partial.digestSchedule === 'off' ||
+    partial.digestSchedule === 'daily' ||
+    partial.digestSchedule === 'weekly'
+  ) {
+    next.digestSchedule = partial.digestSchedule;
+  }
+  if ('lastDigestSentAt' in partial) {
+    next.lastDigestSentAt =
+      typeof partial.lastDigestSentAt === 'string' && partial.lastDigestSentAt
+        ? partial.lastDigestSentAt.slice(0, 64)
+        : undefined;
+  }
+  if ('workspaceMaintenanceUntil' in partial) {
+    next.workspaceMaintenanceUntil =
+      typeof partial.workspaceMaintenanceUntil === 'string' && partial.workspaceMaintenanceUntil
+        ? partial.workspaceMaintenanceUntil.slice(0, 64)
+        : undefined;
   }
 
   db.workspaces[userId] = { ...ws, settings: next };

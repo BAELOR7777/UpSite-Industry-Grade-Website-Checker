@@ -42,14 +42,14 @@ export function ConfirmModal({
       aria-labelledby="upsite-confirm-title"
       className="fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-[1px] flex items-center justify-center p-4"
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-2xl p-6 space-y-4">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#1B1F28] shadow-2xl p-6 space-y-4">
         <div className="flex items-start justify-between gap-4">
           <div className="flex items-start gap-3 min-w-0">
             <div
               className={`w-9 h-9 rounded-lg border flex items-center justify-center shrink-0 ${
                 tone === 'danger'
                   ? 'bg-rose-50 text-rose-600 border-rose-200 dark:bg-rose-500/10 dark:text-rose-400 dark:border-rose-500/20'
-                  : 'bg-slate-100 text-slate-700 border-slate-200 dark:bg-white/[0.06] dark:text-slate-200 dark:border-white/[0.08]'
+                  : 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-500/10 dark:text-blue-400 dark:border-blue-500/20'
               }`}
             >
               <AlertTriangle className="w-4 h-4" strokeWidth={1.8} />
@@ -80,7 +80,7 @@ export function ConfirmModal({
           <button
             type="button"
             onClick={onCancel}
-            className="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-white/[0.07] hover:bg-slate-200 dark:hover:bg-white/[0.12] transition-colors whitespace-nowrap shrink-0"
+            className="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-[#F3F5F8] dark:bg-white/[0.07] hover:bg-slate-200 dark:hover:bg-white/[0.12] transition-colors whitespace-nowrap shrink-0"
           >
             {cancelLabel}
           </button>
@@ -90,7 +90,7 @@ export function ConfirmModal({
             className={`px-4 py-2 rounded-lg text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 ${
               tone === 'danger'
                 ? 'bg-rose-600 hover:bg-rose-500'
-                : 'bg-slate-900 hover:bg-slate-800 dark:bg-rose-600 dark:hover:bg-rose-500'
+                : 'bg-blue-600 hover:bg-blue-500'
             }`}
           >
             {confirmLabel}

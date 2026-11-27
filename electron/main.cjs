@@ -1,11 +1,190 @@
 const path = require('node:path');
 const fs = require('node:fs');
+const zlib = require('node:zlib');
 const { execFile } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Notification,
+  Tray,
+  ipcMain,
+  nativeImage,
+  shell,
+} = require('electron');
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.upsite.desktop');
+}
 
 let mainWindow = null;
 let httpServer = null;
+let tray = null;
+let isQuitting = false;
+let minimizeToTray = true;
+let trayStatusSummary = 'Ready';
+let trayDownCount = 0;
+const startMinimized = process.argv.includes('--minimized');
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k += 1) {
+      c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4);
+  const combined = Buffer.concat([typeBuf, data]);
+  crcBuf.writeUInt32BE(crc32(combined), 0);
+  return Buffer.concat([lenBuf, combined, crcBuf]);
+}
+
+function createTrayIconImage(downCount = 0) {
+  const size = 32;
+  const raw = Buffer.alloc(size * (1 + size * 4));
+  // Cobalt Blue (#2563EB) normally, Crimson (#E11D48) badge dot if sites are down
+  const bgR = 37;
+  const bgG = 99;
+  const bgB = 235;
+
+  for (let y = 0; y < size; y += 1) {
+    const rowStart = y * (1 + size * 4);
+    raw[rowStart] = 0; // filter none
+    for (let x = 0; x < size; x += 1) {
+      const idx = rowStart + 1 + x * 4;
+      const dx = x - 15.5;
+      const dy = y - 15.5;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      // Rounded circle badge
+      if (dist > 14.5) {
+        raw[idx] = 0;
+        raw[idx + 1] = 0;
+        raw[idx + 2] = 0;
+        raw[idx + 3] = 0;
+        continue;
+      }
+
+      // Crisp white "U" / pulse arc inside
+      const inOuterRing = dist >= 6.5 && dist <= 9.2 && (y >= 11 || Math.abs(dx) >= 4.5);
+      const inInnerDot = dist <= 3.1;
+      const isAlertBadge = downCount > 0 && x >= 20 && y <= 11 && Math.hypot(x - 24, y - 7) <= 5.2;
+
+      if (isAlertBadge) {
+        raw[idx] = 225;
+        raw[idx + 1] = 29;
+        raw[idx + 2] = 72;
+        raw[idx + 3] = 255;
+      } else if (inOuterRing || inInnerDot) {
+        raw[idx] = 255;
+        raw[idx + 1] = 255;
+        raw[idx + 2] = 255;
+        raw[idx + 3] = 255;
+      } else {
+        raw[idx] = bgR;
+        raw[idx + 1] = bgG;
+        raw[idx + 2] = bgB;
+        raw[idx + 3] = 255;
+      }
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const idat = zlib.deflateSync(raw);
+  const pngBuffer = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+
+  return nativeImage.createFromBuffer(pngBuffer);
+}
+
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  refreshTrayMenu();
+}
+
+function hideMainWindowToTray() {
+  if (!mainWindow) return;
+  mainWindow.hide();
+  refreshTrayMenu();
+}
+
+function refreshTrayMenu() {
+  if (!tray) return;
+  const visible = Boolean(mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized());
+  tray.setToolTip(`upsite — ${trayStatusSummary}`);
+  const menu = Menu.buildFromTemplate([
+    { label: `upsite · ${trayStatusSummary}`, enabled: false },
+    { type: 'separator' },
+    {
+      label: visible ? 'Minimize to Tray' : 'Show upsite',
+      click: () => {
+        if (visible) hideMainWindowToTray();
+        else showMainWindow();
+      },
+    },
+    {
+      label: 'Run Organisation Checks',
+      click: () => {
+        if (mainWindow) {
+          mainWindow.webContents.send('upsite:tray-run-org');
+        }
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit upsite',
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
+}
+
+function ensureTray() {
+  if (tray) return;
+  try {
+    tray = new Tray(createTrayIconImage(trayDownCount));
+    tray.on('click', () => {
+      if (mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+        hideMainWindowToTray();
+      } else {
+        showMainWindow();
+      }
+    });
+    tray.on('double-click', showMainWindow);
+    refreshTrayMenu();
+  } catch {
+    tray = null;
+  }
+}
 
 function sanitizePdfFilename(raw) {
   const base = path.basename(String(raw || 'upsite-report.pdf')).replace(/[^a-zA-Z0-9._-]/g, '-');
@@ -85,6 +264,77 @@ ipcMain.handle('upsite:share-pdf-file', async (_event, payload) => {
   }
 });
 
+ipcMain.handle('upsite:show-notification', (_event, payload) => {
+  try {
+    if (!Notification.isSupported()) {
+      return { ok: false };
+    }
+    const title = String(payload?.title || 'upsite Alert').slice(0, 120);
+    const body = String(payload?.body || '').slice(0, 300);
+    const id = payload?.id ? String(payload.id) : '';
+    const note = new Notification({
+      title,
+      body,
+      silent: false,
+    });
+    note.on('click', () => {
+      showMainWindow();
+      if (mainWindow && id) {
+        mainWindow.webContents.send('upsite:notification-click', id);
+      }
+    });
+    note.show();
+    if (mainWindow && !mainWindow.isFocused()) {
+      mainWindow.flashFrame(true);
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('upsite:set-tray-settings', (_event, payload) => {
+  minimizeToTray = payload?.minimizeToTray !== false;
+  refreshTrayMenu();
+  return { ok: true };
+});
+
+ipcMain.handle('upsite:minimize-to-tray', () => {
+  ensureTray();
+  hideMainWindowToTray();
+  return { ok: true };
+});
+
+ipcMain.handle('upsite:update-tray-status', (_event, payload) => {
+  const nextDown = typeof payload?.downCount === 'number' ? Math.max(0, payload.downCount) : 0;
+  const nextSummary =
+    typeof payload?.summary === 'string' && payload.summary.trim()
+      ? payload.summary.trim().slice(0, 80)
+      : 'Ready';
+  const iconChanged = (nextDown > 0) !== (trayDownCount > 0);
+  trayDownCount = nextDown;
+  trayStatusSummary = nextSummary;
+  if (tray) {
+    if (iconChanged) {
+      tray.setImage(createTrayIconImage(trayDownCount));
+    }
+    refreshTrayMenu();
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('upsite:set-launch-at-startup', (_event, enabled) => {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: Boolean(enabled),
+      args: ['--minimized'],
+    });
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+});
+
 async function listenOnPort(expressApp, port) {
   return new Promise((resolve, reject) => {
     const srv = expressApp.listen(port, '127.0.0.1', () => {
@@ -127,17 +377,72 @@ async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
-    minWidth: 960,
-    minHeight: 640,
+    minWidth: 420,
+    minHeight: 480,
+    show: !startMinimized,
     title: 'upsite',
-    backgroundColor: '#0F111A',
+    backgroundColor: '#111318',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
     },
+  });
+
+  ensureTray();
+
+  mainWindow.on('focus', () => {
+    mainWindow?.flashFrame(false);
+    refreshTrayMenu();
+  });
+
+  mainWindow.on('show', refreshTrayMenu);
+  mainWindow.on('hide', refreshTrayMenu);
+
+  mainWindow.on('minimize', (event) => {
+    if (minimizeToTray && tray) {
+      event.preventDefault();
+      hideMainWindowToTray();
+    }
+  });
+
+  mainWindow.on('close', (event) => {
+    if (!isQuitting && minimizeToTray && tray) {
+      event.preventDefault();
+      hideMainWindowToTray();
+    }
+  });
+
+  // Enable standard right-click Cut / Copy / Paste / Select All context menu everywhere
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const template = [];
+    if (params.isEditable) {
+      template.push(
+        { label: 'Undo', role: 'undo', enabled: params.editFlags.canUndo },
+        { label: 'Redo', role: 'redo', enabled: params.editFlags.canRedo },
+        { type: 'separator' },
+        { label: 'Cut', role: 'cut', enabled: params.editFlags.canCut },
+        { label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy },
+        { label: 'Paste', role: 'paste', enabled: params.editFlags.canPaste },
+        { type: 'separator' },
+        { label: 'Select All', role: 'selectAll', enabled: params.editFlags.canSelectAll },
+      );
+    } else if (params.selectionText && params.selectionText.trim().length > 0) {
+      template.push(
+        { label: 'Copy', role: 'copy' },
+        { label: 'Select All', role: 'selectAll' },
+      );
+    } else {
+      template.push({ label: 'Select All', role: 'selectAll' });
+    }
+
+    if (template.length > 0) {
+      const menu = Menu.buildFromTemplate(template);
+      menu.popup({ window: mainWindow });
+    }
   });
 
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
@@ -167,7 +472,26 @@ async function createWindow() {
 
 app.whenReady().then(createWindow);
 
+app.on('activate', () => {
+  if (mainWindow) {
+    showMainWindow();
+  } else {
+    void createWindow();
+  }
+});
+
+app.on('before-quit', () => {
+  isQuitting = true;
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
+});
+
 app.on('window-all-closed', () => {
+  if (!isQuitting && minimizeToTray && tray) {
+    return;
+  }
   if (httpServer) {
     httpServer.close();
     httpServer = null;

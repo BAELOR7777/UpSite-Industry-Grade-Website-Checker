@@ -37,19 +37,19 @@ export function NotificationBellButton({
         onClick={() => setOpen((prev) => !prev)}
         aria-expanded={open}
         aria-label="Notifications"
-        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#171A28] hover:bg-slate-50 dark:hover:bg-[#1E2235] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-[#1B1F28] hover:bg-slate-50 dark:hover:bg-[#222734] border border-slate-200 dark:border-white/[0.08] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
       >
         <Bell
           className={`w-3.5 h-3.5 shrink-0 ${
             unreadCount > 0
-              ? 'text-rose-600 dark:text-rose-400'
+              ? 'text-blue-600 dark:text-blue-400'
               : 'text-slate-500 dark:text-slate-400'
           }`}
           strokeWidth={1.8}
         />
         <span>Alerts</span>
         {unreadCount > 0 && (
-          <span className="font-mono tabular-nums text-rose-600 dark:text-rose-400">
+          <span className="font-mono tabular-nums text-blue-600 dark:text-blue-400">
             {unreadCount}
           </span>
         )}
@@ -59,7 +59,7 @@ export function NotificationBellButton({
         <div
           role="dialog"
           aria-label="Notification center"
-          className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#171A28] shadow-xl z-50 overflow-hidden"
+          className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#1B1F28] shadow-xl z-50 overflow-hidden"
         >
           <div className="px-4 py-3 border-b border-slate-200 dark:border-white/[0.07] flex items-center justify-between gap-3">
             <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
@@ -107,7 +107,7 @@ export function NotificationBellButton({
                     className={`px-4 py-3 space-y-2 transition-colors ${
                       item.read
                         ? 'bg-transparent'
-                        : 'bg-slate-50/90 dark:bg-white/[0.03]'
+                        : 'bg-blue-50/50 dark:bg-blue-500/[0.06]'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2.5">
@@ -141,7 +141,7 @@ export function NotificationBellButton({
                           onViewNotification(item);
                           setOpen(false);
                         }}
-                        className="inline-flex items-center gap-1 text-xs font-medium text-rose-600 hover:text-rose-500 dark:text-rose-400 dark:hover:text-rose-300 whitespace-nowrap"
+                        className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300 whitespace-nowrap"
                       >
                         <span>View now</span>
                         <ArrowRight className="w-3 h-3 shrink-0" strokeWidth={2} />
@@ -175,7 +175,7 @@ export function NotificationToastStack({
     <div
       aria-live="polite"
       aria-label="Live check notifications"
-      className="fixed bottom-5 right-5 z-40 w-[min(24rem,calc(100vw-2.5rem))] space-y-2.5 pointer-events-none"
+      className="fixed bottom-4 right-4 z-40 w-[min(24rem,calc(100vw-2rem))] space-y-2.5 pointer-events-none"
     >
       {toasts.slice(0, 3).map((toast) => {
         const hasIssues = toast.downCount > 0 || (toast.newErrorCount ?? 0) > 0;
@@ -185,7 +185,7 @@ export function NotificationToastStack({
           <div
             key={toast.id}
             role="status"
-            className="pointer-events-auto rounded-xl border border-slate-200 dark:border-white/[0.12] bg-white dark:bg-[#171A28] shadow-xl px-4 py-3.5 space-y-2.5"
+            className="pointer-events-auto rounded-xl border border-slate-200 dark:border-white/[0.12] bg-white dark:bg-[#1B1F28] shadow-xl px-4 py-3.5 space-y-2.5"
           >
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-start gap-2.5 min-w-0">
@@ -228,11 +228,7 @@ export function NotificationToastStack({
               <button
                 type="button"
                 onClick={() => onViewNow(toast)}
-                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  hasIssues
-                    ? 'bg-rose-600 hover:bg-rose-500 text-white'
-                    : 'bg-slate-900 hover:bg-slate-800 dark:bg-white/[0.12] dark:hover:bg-white/[0.18] text-white'
-                }`}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-colors whitespace-nowrap shrink-0"
               >
                 <span>View now</span>
                 <ArrowRight className="w-3 h-3 shrink-0" strokeWidth={2} />
