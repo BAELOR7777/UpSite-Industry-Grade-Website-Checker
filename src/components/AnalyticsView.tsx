@@ -30,6 +30,7 @@ import {
   shareResultsPdf,
 } from '../utils/exporters';
 import { ReportActionBar } from './ReportActionBar';
+import { computeUrlSmartThresholdMap } from '../utils/smartThreshold';
 
 interface AnalyticsViewProps {
   history: SiteCheckResult[];
@@ -187,6 +188,11 @@ export function AnalyticsView({
     });
   }, [incidents, range, selectedOrg]);
 
+  const urlThresholdMap = useMemo(
+    () => computeUrlSmartThresholdMap(organisations, history, settings),
+    [organisations, history, settings],
+  );
+
   // Single-pass core KPIs, percentiles, latency distribution, error breakdown & endpoint leaderboard
   const {
     metrics,
@@ -232,10 +238,16 @@ export function AnalyticsView({
       else if (item.status === 'offline') offline += 1;
       else error += 1;
 
+      const key = (item.normalizedUrl || item.inputUrl).toLowerCase();
       if (typeof item.responseTimeMs === 'number') {
         latencies.push(item.responseTimeMs);
-        if (item.responseTimeMs <= fastCutoff) fastCount += 1;
-        else if (item.responseTimeMs <= slowThresh) moderateCount += 1;
+        const smartInfo = settings.smartThresholdEnabled
+          ? urlThresholdMap.get(key) || urlThresholdMap.get(item.inputUrl.toLowerCase())
+          : undefined;
+        const itemSlowThresh = smartInfo ? smartInfo.thresholdMs : slowThresh;
+        const itemFastCutoff = Math.min(350, Math.round(itemSlowThresh * 0.4));
+        if (item.responseTimeMs <= itemFastCutoff) fastCount += 1;
+        else if (item.responseTimeMs <= itemSlowThresh) moderateCount += 1;
         else slowCount += 1;
       }
 
@@ -249,7 +261,6 @@ export function AnalyticsView({
         }
       }
 
-      const key = (item.normalizedUrl || item.inputUrl).toLowerCase();
       const ts = Date.parse(item.checkedAt) || 0;
       let ep = endpointMap.get(key);
       if (!ep) {
@@ -433,7 +444,7 @@ export function AnalyticsView({
       },
       mttrMs: computedMttr,
     };
-  }, [rangedHistory, organisations, selectedOrg, scopedIncidents, settings.slowThresholdMs]);
+  }, [rangedHistory, organisations, selectedOrg, scopedIncidents, settings.slowThresholdMs, settings.smartThresholdEnabled, urlThresholdMap]);
 
   // Filtered & sorted endpoint leaderboard (single memo pass)
   const { visibleEndpoints, totalMatchingEndpoints } = useMemo(() => {
@@ -443,7 +454,13 @@ export function AnalyticsView({
     const filtered = endpointStats.filter((ep) => {
       if (q && !ep.url.toLowerCase().includes(q)) return false;
       if (endpointFilter === 'issues' && ep.issues === 0) return false;
-      if (endpointFilter === 'slow' && (ep.avgMs === null || ep.avgMs <= slowThresh)) return false;
+      if (endpointFilter === 'slow') {
+        const smartInfo = settings.smartThresholdEnabled
+          ? urlThresholdMap.get(ep.key) || urlThresholdMap.get(ep.latest.inputUrl.toLowerCase())
+          : undefined;
+        const epSlowThresh = smartInfo ? smartInfo.thresholdMs : slowThresh;
+        if (ep.avgMs === null || ep.avgMs <= epSlowThresh) return false;
+      }
       return true;
     });
 
@@ -465,7 +482,7 @@ export function AnalyticsView({
       visibleEndpoints: showAllEndpoints ? filtered : filtered.slice(0, 12),
       totalMatchingEndpoints: filtered.length,
     };
-  }, [endpointStats, endpointSearch, endpointFilter, endpointSort, showAllEndpoints, settings.slowThresholdMs]);
+  }, [endpointStats, endpointSearch, endpointFilter, endpointSort, showAllEndpoints, settings.slowThresholdMs, settings.smartThresholdEnabled, urlThresholdMap]);
 
   // Expiring SSL certificates across latest monitored endpoints
   const expiringSslSites = useMemo(() => {
@@ -653,8 +670,10 @@ export function AnalyticsView({
           </p>
           <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
             {metrics.p50LatencyMs !== null && metrics.p95LatencyMs !== null
-              ? `P50 ${metrics.p50LatencyMs} ms · P95 ${metrics.p95LatencyMs} ms`
-              : `Slow limit: ${settings.slowThresholdMs > 0 ? `${settings.slowThresholdMs} ms` : 'Off'}`}
+              ? `P50 ${metrics.p50LatencyMs} ms · P95 ${metrics.p95LatencyMs} ms${settings.smartThresholdEnabled ? ' · Smart 7d' : ''}`
+              : settings.smartThresholdEnabled
+                ? `Smart 7d auto (${settings.smartThresholdSensitivity || 'balanced'})`
+                : `Slow limit: ${settings.slowThresholdMs > 0 ? `${settings.slowThresholdMs} ms` : 'Off'}`}
           </p>
         </div>
 
@@ -777,8 +796,11 @@ export function AnalyticsView({
                 <span>Speed Mix ({speedDistribution.total} timed)</span>
                 <span>
                   Fast &le;{speedDistribution.fastCutoff}ms: {speedDistribution.fast} · Normal:{' '}
-                  {speedDistribution.moderate} · Slow &gt;{speedDistribution.slowThresh}ms:{' '}
-                  {speedDistribution.slow}
+                  {speedDistribution.moderate} · Slow &gt;
+                  {settings.smartThresholdEnabled && urlThresholdMap.size > 0
+                    ? 'Smart 7d'
+                    : `${speedDistribution.slowThresh}ms`}
+                  : {speedDistribution.slow}
                 </span>
               </div>
               <div className="h-2 rounded-full overflow-hidden flex bg-slate-100 dark:bg-white/[0.06]">

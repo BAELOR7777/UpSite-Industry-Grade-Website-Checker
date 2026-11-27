@@ -9,6 +9,7 @@ import {
   Play,
   Trash2,
   XCircle,
+  Zap,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
@@ -30,6 +31,7 @@ import {
 } from '../utils/exporters';
 import { isWithinCheckWindow } from '../utils/intervals';
 import { ConfirmModal } from './ConfirmModal';
+import { QuickTestModal } from './QuickTestModal';
 import { ReportActionBar } from './ReportActionBar';
 
 interface CheckerViewProps {
@@ -45,6 +47,7 @@ interface CheckerViewProps {
   integrations?: IntegrationChannel[];
   onChangeStatusFilter: (filter: 'all' | 'issues' | SiteStatus) => void;
   onRunCheck: (urls: string[], rules?: ProjectCheckRules) => void;
+  onQuickTestUrl: (url: string) => Promise<SiteCheckResult>;
   onSelectResult: (result: SiteCheckResult) => void;
   onClearResults: () => void;
   onSendToApps?: (
@@ -86,12 +89,14 @@ export function CheckerView({
   integrations = [],
   onChangeStatusFilter,
   onRunCheck,
+  onQuickTestUrl,
   onSelectResult,
   onClearResults,
   onSendToApps,
   onOpenIntegrationsSettings,
 }: CheckerViewProps) {
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [quickTestOpen, setQuickTestOpen] = useState(false);
   const [keywordOpen, setKeywordOpen] = useState(false);
   const [expectedKeyword, setExpectedKeyword] = useState('');
   const [forbiddenKeyword, setForbiddenKeyword] = useState('');
@@ -145,7 +150,8 @@ export function CheckerView({
   const isCompact = settings.density === 'compact';
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 sm:p-6 lg:p-7 space-y-5">
+    <div className="relative flex-1 flex flex-col min-w-0 min-h-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 sm:p-6 lg:p-7 pb-20 space-y-5">
       {/* URL Input Card */}
       <section className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-white dark:bg-[#1B1F28] p-4 sm:p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-4">
@@ -509,6 +515,26 @@ export function CheckerView({
           setConfirmClearOpen(false);
         }}
         onCancel={() => setConfirmClearOpen(false)}
+      />
+      </div>
+
+      {/* Floating Quick Test Button */}
+      <button
+        type="button"
+        onClick={() => setQuickTestOpen(true)}
+        aria-label="Quick Test single URL"
+        className="absolute bottom-5 right-5 sm:bottom-6 sm:right-7 z-30 inline-flex items-center gap-2 px-4 py-2.5 min-h-[42px] rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-950/20 dark:shadow-black/45 border border-blue-500/30 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+      >
+        <Zap className="w-4 h-4 shrink-0" strokeWidth={2} />
+        <span>Quick Test</span>
+      </button>
+
+      <QuickTestModal
+        open={quickTestOpen}
+        settings={settings}
+        onClose={() => setQuickTestOpen(false)}
+        onRunQuickTest={onQuickTestUrl}
+        onInspectResult={onSelectResult}
       />
     </div>
   );

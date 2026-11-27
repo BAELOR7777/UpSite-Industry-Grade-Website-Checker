@@ -149,6 +149,8 @@ export interface UserSettings {
   timeoutMs: 5000 | 8500 | 15000;
   defaultProtocol: 'https' | 'http';
   slowThresholdMs: 0 | 500 | 1000 | 2000;
+  smartThresholdEnabled: boolean;
+  smartThresholdSensitivity: 'tight' | 'balanced' | 'relaxed';
   autoInspectFirstIssue: boolean;
   autoRefreshSec: AutoRefreshInterval;
   checkWindow: CheckTimeWindow;

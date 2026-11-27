@@ -91,6 +91,8 @@ const DEFAULT_SETTINGS: UserSettings = {
   timeoutMs: 8500,
   defaultProtocol: 'https',
   slowThresholdMs: 1000,
+  smartThresholdEnabled: false,
+  smartThresholdSensitivity: 'balanced',
   autoInspectFirstIssue: false,
   autoRefreshSec: 0,
   checkWindow: { ...DEFAULT_CHECK_WINDOW },
@@ -573,6 +575,40 @@ export default function App() {
       }
     },
     [runCheckBatch],
+  );
+
+  const handleQuickTestUrl = useCallback(
+    async (rawUrl: string): Promise<SiteCheckResult> => {
+      if (!currentUser) {
+        throw new Error('Sign in required to verify URLs.');
+      }
+      const activeSettings = settingsRef.current;
+      const response = await fetch('/api/check', {
+        method: 'POST',
+        credentials: 'include',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          url: rawUrl.trim(),
+          skipHistory: true,
+          options: {
+            timeoutMs: activeSettings.timeoutMs,
+            defaultProtocol: activeSettings.defaultProtocol,
+            deepInspect: activeSettings.deepInspect,
+            sslWarningDays: activeSettings.sslWarningDays ?? 14,
+          },
+        }),
+      });
+      if (response.status === 401) {
+        handleSignOut();
+        throw new Error('Session expired. Please sign in again.');
+      }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.result) {
+        throw new Error(data?.error || 'Unable to verify website availability.');
+      }
+      return data.result as SiteCheckResult;
+    },
+    [authHeaders, currentUser, handleSignOut],
   );
 
   // Auto-Refresh Monitor Timer for active Checker batch
@@ -1627,6 +1663,7 @@ export default function App() {
               integrations={settings.integrations || []}
               onChangeStatusFilter={setCheckerStatusFilter}
               onRunCheck={handleRunChecker}
+              onQuickTestUrl={handleQuickTestUrl}
               onSelectResult={(item) => setSelectedResult(item)}
               onClearResults={handleClearResults}
               onSendToApps={handleSendReportToApps}
@@ -1637,6 +1674,7 @@ export default function App() {
           {activeView === 'organisation' && (
             <OrganisationView
               organisations={organisations}
+              history={history}
               settings={settings}
               selectedResultId={selectedResult?.id ?? null}
               openedOrgId={openedOrgId}

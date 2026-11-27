@@ -124,6 +124,8 @@ export const DEFAULT_SETTINGS: UserSettings = {
   timeoutMs: 8500,
   defaultProtocol: 'https',
   slowThresholdMs: 1000,
+  smartThresholdEnabled: false,
+  smartThresholdSensitivity: 'balanced',
   autoInspectFirstIssue: false,
   autoRefreshSec: 0,
   checkWindow: { ...DEFAULT_CHECK_WINDOW },
@@ -605,6 +607,16 @@ export function updateUserSettings(
     partial.slowThresholdMs === 2000
   ) {
     next.slowThresholdMs = partial.slowThresholdMs;
+  }
+  if (typeof partial.smartThresholdEnabled === 'boolean') {
+    next.smartThresholdEnabled = partial.smartThresholdEnabled;
+  }
+  if (
+    partial.smartThresholdSensitivity === 'tight' ||
+    partial.smartThresholdSensitivity === 'balanced' ||
+    partial.smartThresholdSensitivity === 'relaxed'
+  ) {
+    next.smartThresholdSensitivity = partial.smartThresholdSensitivity;
   }
   if (typeof partial.autoInspectFirstIssue === 'boolean') {
     next.autoInspectFirstIssue = partial.autoInspectFirstIssue;

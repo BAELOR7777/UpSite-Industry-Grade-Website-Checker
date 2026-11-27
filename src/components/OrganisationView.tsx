@@ -68,6 +68,7 @@ import { mergeImportedProjects } from '../utils/projectTransfer';
 import type { ImportConflictMode, ImportedProjectDraft } from '../utils/projectTransfer';
 import { BulkImportModal, ExportProjectsModal } from './ProjectTransferModals';
 import { ReportActionBar, SendReportModal } from './ReportActionBar';
+import { computeProjectThresholdsMap } from '../utils/smartThreshold';
 
 export interface PendingOrgReport {
   orgName: string;
@@ -79,6 +80,7 @@ export interface PendingOrgReport {
 
 interface OrganisationViewProps {
   organisations: Organisation[];
+  history?: SiteCheckResult[];
   settings: UserSettings;
   selectedResultId: string | null;
   openedOrgId: string | null;
@@ -180,6 +182,7 @@ function formatRulesSummary(
 
 export function OrganisationView({
   organisations,
+  history = [],
   settings,
   selectedResultId,
   openedOrgId,
@@ -1357,6 +1360,12 @@ export function OrganisationView({
               showCustomRules,
               showKeywordChecks,
             );
+            const projectSmartMap = computeProjectThresholdsMap(
+              [project],
+              history,
+              settings,
+            );
+            const thresholdInfo = projectSmartMap.get(project.id);
 
             return (
               <section
@@ -1387,6 +1396,11 @@ export function OrganisationView({
                         {project.urls.length} {project.urls.length === 1 ? 'URL' : 'URLs'}
                         {project.lastResults && project.lastResults.length > 0
                           ? ` · ${onlineCount} Online · ${issueCount} Issue`
+                          : ''}
+                        {settings.smartThresholdEnabled && thresholdInfo
+                          ? thresholdInfo.isSmartActive
+                            ? ` · Smart Limit: ${thresholdInfo.thresholdMs} ms (7d avg ${thresholdInfo.rollingAvgMs} ms)`
+                            : ` · Smart Limit: Learning (${thresholdInfo.sampleCount}/2)`
                           : ''}
                         {rulesSummary ? ` · Rules: ${rulesSummary}` : ''}
                         {lastCheckedLabel
@@ -1471,10 +1485,12 @@ export function OrganisationView({
                             ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-500/10 dark:text-rose-300 dark:border-rose-500/20'
                             : 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-500/10 dark:text-amber-300 dark:border-amber-500/20';
 
+                      const effectiveSlowMs =
+                        thresholdInfo?.thresholdMs ?? settings.slowThresholdMs;
                       const isSlow =
-                        settings.slowThresholdMs > 0 &&
+                        effectiveSlowMs > 0 &&
                         result.responseTimeMs !== null &&
-                        result.responseTimeMs > settings.slowThresholdMs;
+                        result.responseTimeMs > effectiveSlowMs;
 
                       return (
                         <button
@@ -1499,7 +1515,10 @@ export function OrganisationView({
 
                           <div className="flex items-center gap-4 shrink-0">
                             {isSlow && (
-                              <span className="text-xs font-medium text-amber-600 dark:text-amber-400 whitespace-nowrap shrink-0">
+                              <span
+                                title={`Exceeds ${thresholdInfo?.isSmartActive ? '7-day smart' : 'slow'} threshold (${effectiveSlowMs} ms)`}
+                                className="text-xs font-medium text-amber-600 dark:text-amber-400 whitespace-nowrap shrink-0"
+                              >
                                 Slow
                               </span>
                             )}

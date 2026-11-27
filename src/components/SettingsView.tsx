@@ -454,7 +454,9 @@ export function SettingsView({
                 Slow Response Warning
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Flag online sites that exceed this latency threshold so performance drops stand out.
+                {settings.smartThresholdEnabled
+                  ? 'Fallback latency threshold used until a project builds a 7-day baseline (or when Smart Threshold is off).'
+                  : 'Flag online sites that exceed this latency threshold so performance drops stand out.'}
               </p>
             </div>
             <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.07]">
@@ -480,6 +482,77 @@ export function SettingsView({
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="px-4 sm:px-5 py-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="space-y-0.5 max-w-xl">
+                <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                  Smart Threshold (Rolling 7-Day Auto-Adjust)
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Automatically tunes each project&apos;s slow-response threshold from its rolling
+                  7-day average latency once at least 2 checks are recorded.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(settings.smartThresholdEnabled)}
+                onClick={() =>
+                  onUpdateSettings({
+                    smartThresholdEnabled: !settings.smartThresholdEnabled,
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  settings.smartThresholdEnabled
+                    ? 'bg-blue-600'
+                    : 'bg-slate-300 dark:bg-white/[0.14]'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    settings.smartThresholdEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {settings.smartThresholdEnabled && (
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  Sensitivity multiplier above 7-day project average
+                </span>
+                <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-[#F3F5F8] dark:bg-[#12151C] border border-slate-200 dark:border-white/[0.07]">
+                  {(
+                    [
+                      { value: 'tight', label: 'Tight 1.5x' },
+                      { value: 'balanced', label: 'Balanced 2.0x' },
+                      { value: 'relaxed', label: 'Relaxed 2.5x' },
+                    ] as const
+                  ).map((opt) => {
+                    const active =
+                      (settings.smartThresholdSensitivity || 'balanced') === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() =>
+                          onUpdateSettings({ smartThresholdSensitivity: opt.value })
+                        }
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium tabular-nums transition-colors whitespace-nowrap shrink-0 ${
+                          active
+                            ? 'bg-blue-600 text-white'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Simplified Timer & Time Period Bar */}
